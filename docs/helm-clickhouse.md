@@ -565,11 +565,14 @@ Two properties of the storage-tiering + `sessionAffinity` work hold under
   OTHER shard a `Distributed` query reads from is decided inside ClickHouse
   by the `load_balancing` setting, invisible to and uncoordinated by any k8s
   Service. Cerberus therefore stamps `load_balancing=first_or_random` +
-  `load_balancing_first_offset=0` UNCONDITIONALLY on every data-plane query
-  (`internal/chclient/distributed_query_settings.go`), so — absent any
-  recorded connection errors — every statement against a remote shard's
-  `Distributed` connection pool deterministically selects that ONE offset-0
-  replica (this chart's `<replica>` list is rendered in StatefulSet-ordinal
+  `load_balancing_first_offset=0`, plus `use_hedged_requests=0`,
+  UNCONDITIONALLY on every data-plane query
+  (`internal/chclient/distributed_query_settings.go`), so every statement
+  against a remote shard's `Distributed` connection pool deterministically
+  selects that ONE offset-0 replica, however slowly it answers, unless
+  connecting to it fails (recorded in `system.clusters.errors_count`), it is
+  stale past `max_replica_delay_for_distributed_queries`, or it lacks the
+  table (this chart's `<replica>` list is rendered in StatefulSet-ordinal
   order with no `<priority>` tag, so offset 0 always names that shard's own
   `-0` pod). See
   [`operations.md`'s per-query-setting table](operations.md#per-query-setting--distributed-behavior)
@@ -579,8 +582,10 @@ Two properties of the storage-tiering + `sessionAffinity` work hold under
   remote shard's `Distributed` connection on that shard's ONE offset-0
   replica while it stays healthy; the shard's other replicas serve
   durability/failover only, not read-scaling, for as long as this pin
-  stands. An operator who needs read-scaling across a shard's replicas
-  overrides `load_balancing` via a server-side settings profile. The
+  stands, and a slow offset-0 replica is waited on rather than raced by
+  ClickHouse's hedged requests. An operator who needs read-scaling across a
+  shard's replicas overrides `load_balancing` via a server-side settings
+  profile. The
   behaviour is verified empirically on a real multi-replica-per-shard k3d
   cluster by the `datashard-replica-affinity` e2e leg
   (`.github/workflows/e2e.yml`,
@@ -588,7 +593,8 @@ Two properties of the storage-tiering + `sessionAffinity` work hold under
   remote-shard child statement within a genuinely solver-split (`kEff > 1`)
   trace is asserted to land on the SAME `system.query_log.hostname` — and
   specifically on each shard's own ordinal-0 pod, confirming the mechanism,
-  not just its consequence.
+  not just its consequence — and every statement is asserted to have run
+  with `use_hedged_requests=0`.
 
   See [`helm-clickhouse.background.md`](helm-clickhouse.background.md) for
   how the pin was arrived at and why the trade-off is permanent.

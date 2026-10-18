@@ -46,6 +46,15 @@
 //      confirming the MECHANISM (first_or_random + offset 0 always prefers
 //      the config-order-first replica), not merely a coincidental agreement.
 //
+//   5. Every statement of those traces reached the initiator with
+//      `use_hedged_requests=0` (read back from `system.query_log.Settings`)
+//      — the mechanism that keeps a merely SLOW offset-0 replica from being
+//      raced and replaced mid-trace (cerberus issue #3148), checked at the
+//      server rather than inferred from cerberus's own settings map. A
+//      `HedgedRequestsChangeReplica` count is not asserted: with hedging off
+//      no code path increments it, so it could only fire alongside this
+//      check; it is printed in the failure evidence instead.
+//
 // Point 3 is what a regression would break: revert the load_balancing pin to
 // ClickHouse's own default (`random`) and this assertion starts failing
 // intermittently the moment a split trace's remote-shard children are
@@ -88,15 +97,34 @@
 // cluster-up can wait out the same race, not just this one — before firing
 // the affinity-verify burst. That proves the fan-out load only starts once
 // the cluster has actually settled, rather than inferring settlement from
-// pod readiness alone.
+// pod readiness alone. The poll reads EVERY node's `system.clusters`, not
+// only `pod`'s: each ClickHouse server keeps its own per-peer error state,
+// and either data-shard-0 replica can be the initiator a cerberus pod's
+// sessionAffinity lands on.
+//
+// A clean errors_count is necessary, not sufficient: ClickHouse's hedged
+// requests (`use_hedged_requests`, on by default) race a replica that is
+// merely slow to connect or to send its first packet and demote it through
+// `slowdown_count`, which errors_count never shows. That is why cerberus
+// pins `use_hedged_requests=0` (internal/chclient/
+// distributed_query_settings.go) and why point 5 above asserts it reached
+// the server.
+//
+// ON FAILURE this script prints the replica-selection evidence captured at
+// that moment — every node's `system.clusters` row (errors_count,
+// slowdowns_count, estimated_recovery_time) and, per multi-statement trace,
+// the initiator rows' hedging settings and profile events plus the child
+// statements grouped by (hostname, type) — so a divergence is diagnosable
+// from the job log alone, after the cluster is torn down.
 
 import process from 'node:process';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { error, notice, log, capture } from './lib/gh.mjs';
+import { error, notice, log, capture, group } from './lib/gh.mjs';
 import {
   makeKubectl,
   clickhousePodName,
   chQuery,
+  chQueryRaw,
   waitForClusterHealth,
   clusterHealthDefaultDeadlineSeconds,
 } from './lib/k8s.mjs';
@@ -176,6 +204,64 @@ function hostnameShardReplica(hostname) {
   return { shard: Number(m[1]), replica: Number(m[2]) };
 }
 
+// sqlStringList renders trace ids (hex, read back from query_log itself) as
+// a ClickHouse string-literal list for an IN clause.
+function sqlStringList(values) {
+  return values.map((v) => `'${v.replace(/[^0-9a-fA-F-]/g, '')}'`).join(', ');
+}
+
+// dumpSelectionEvidence prints, on the failure path only, the server-side
+// state that decides remote-shard replica selection, captured while the
+// cluster still exists: every node's system.clusters row and, for each
+// multi-statement trace in the window, the initiator rows' hedging
+// settings/profile events and the child statements per (hostname, type).
+// Best-effort by design — chQueryRaw never exits, so a failing evidence
+// query cannot mask the assertion failure that triggered the dump, and every
+// `clusterAllReplicas` read here runs with skip_unavailable_shards=1 so one
+// down replica — often the very cause being diagnosed — leaves the rest of
+// the evidence intact rather than failing the whole query.
+const evidenceSettings = 'SETTINGS skip_unavailable_shards = 1';
+
+function dumpSelectionEvidence(pod, traces, windowStart, windowEnd) {
+  const dump = (title, sql) =>
+    group(title, () => {
+      const res = chQueryRaw(kubectl, pod, { ...CH_OPTS, format: 'PrettyCompactNoEscapes' }, sql);
+      process.stdout.write(res.status === 0 ? `${res.stdout}\n` : `evidence query failed: ${res.stderr.trim()}\n`);
+    });
+  dump(
+    'replica-selection evidence: system.clusters on every node',
+    `SELECT hostName() AS node, shard_num, replica_num, host_name, errors_count, slowdowns_count, estimated_recovery_time
+     FROM clusterAllReplicas('${CH_CLUSTER}', system.clusters) WHERE cluster = '${CH_CLUSTER}'
+     ORDER BY node, shard_num, replica_num
+     ${evidenceSettings}`,
+  );
+  if (traces.length === 0) return;
+  const window = `event_time >= toDateTime(${windowStart}) AND event_time <= toDateTime(${windowEnd})`;
+  dump(
+    'replica-selection evidence: initiator statements per trace (hedging settings + profile events)',
+    `SELECT substring(query_id, 1, 32) AS trace, hostname AS initiator, type, count() AS statements,
+            groupUniqArray(Settings['use_hedged_requests']) AS use_hedged_requests,
+            groupUniqArray(Settings['load_balancing']) AS load_balancing,
+            sum(ProfileEvents['HedgedRequestsChangeReplica']) AS hedged_replica_changes,
+            sum(ProfileEvents['DistributedConnectionFailTry']) AS connection_fail_tries,
+            sum(ProfileEvents['DistributedConnectionFailAtAll']) AS connection_fail_at_all
+     FROM clusterAllReplicas('${CH_CLUSTER}', system.query_log)
+     WHERE is_initial_query = 1 AND ${window} AND substring(query_id, 1, 32) IN (${sqlStringList(traces)})
+     GROUP BY trace, initiator, type ORDER BY trace, initiator, type
+     ${evidenceSettings}`,
+  );
+  dump(
+    'replica-selection evidence: child statements per trace by (hostname, type)',
+    `SELECT substring(initial_query_id, 1, 32) AS trace, hostname, type, count() AS statements,
+            min(event_time_microseconds) AS first_at, max(event_time_microseconds) AS last_at,
+            groupUniqArray(exception_code) AS exception_codes
+     FROM clusterAllReplicas('${CH_CLUSTER}', system.query_log)
+     WHERE is_initial_query = 0 AND ${window} AND substring(initial_query_id, 1, 32) IN (${sqlStringList(traces)})
+     GROUP BY trace, hostname, type ORDER BY trace, first_at
+     ${evidenceSettings}`,
+  );
+}
+
 async function main() {
   const pod = clickhousePodName(kubectl, NS);
   log(`replica-affinity verify: namespace=${NS} db=${DB} cluster=${CH_CLUSTER} dataShardCount=${DATA_SHARD_COUNT} replicas=${REPLICAS} pod=${pod}`);
@@ -216,6 +302,7 @@ async function main() {
     });
     log(`cluster health confirmed clean (errors_count=0 for every replica) after ${settleSeconds.toFixed(1)}s`);
   } catch (e) {
+    dumpSelectionEvidence(pod, [], 0, 0);
     error(e.message);
     process.exit(1);
   }
@@ -324,7 +411,42 @@ async function main() {
     failures++;
   }
 
+  // ---- point 5: hedged requests were off for every statement, at the server ----
+  // chQueryRaw, not chQueryTSV: a failed read here is one more assertion
+  // failure, and must still reach the evidence dump below rather than exit.
+  const hedgingRes = chQueryRaw(
+    kubectl,
+    pod,
+    { ...CH_OPTS, format: 'TSVRaw' },
+    `SELECT substring(query_id, 1, 32) AS trace, count() AS statements,
+            countIf(Settings['use_hedged_requests'] != '0') AS hedging_enabled
+     FROM clusterAllReplicas('${CH_CLUSTER}', system.query_log)
+     WHERE is_initial_query = 1 AND type = 'QueryFinish'
+       AND event_time >= toDateTime(${windowStart}) AND event_time <= toDateTime(${windowEnd})
+       AND substring(query_id, 1, 32) IN (${sqlStringList(multiStatementTraces)})
+     GROUP BY trace`,
+  );
+  if (hedgingRes.status !== 0) {
+    error(`hedging check query failed: ${hedgingRes.stderr.trim()}`);
+    failures++;
+  }
+  const hedgingRows = hedgingRes.status === 0
+    ? hedgingRes.stdout.split('\n').map((l) => l.trimEnd()).filter((l) => l.length > 0)
+    : [];
+  for (const row of hedgingRows) {
+    const [trace, statements, hedgingEnabled] = row.split('\t');
+    if (Number(hedgingEnabled) !== 0) {
+      error(`trace ${trace}: ${hedgingEnabled} of ${statements} initiator statement(s) ran without use_hedged_requests=0 — a slow offset-0 replica can be raced and replaced mid-trace`);
+      failures++;
+    }
+  }
+  if (hedgingRes.status === 0 && hedgingRows.length !== multiStatementTraces.length) {
+    error(`hedging check read ${hedgingRows.length} trace(s) from system.query_log; want all ${multiStatementTraces.length} multi-statement trace(s)`);
+    failures++;
+  }
+
   if (failures > 0) {
+    dumpSelectionEvidence(pod, multiStatementTraces, windowStart, windowEnd);
     error(`e2e-datashard-replica-affinity-verify: ${failures} assertion(s) failed`);
     process.exit(1);
   }

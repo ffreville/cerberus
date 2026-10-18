@@ -72,7 +72,7 @@ test('chQuery returns trimmed stdout on success', () => {
 });
 
 test('waitForClusterHealth resolves once every replica reports errors_count=0', async () => {
-  const { capture, calls } = fakeCapture([{ status: 0, stdout: '0\t0\t0\n0\t1\t0\n', stderr: '' }]);
+  const { capture, calls } = fakeCapture([{ status: 0, stdout: 'ch-0-0\t1\t1\t0\nch-0-1\t1\t2\t0\n', stderr: '' }]);
   const kubectl = makeKubectl(capture, 'cerberus');
   const elapsed = await waitForClusterHealth(kubectl, 'chpod', { database: 'otel' }, {
     cluster: 'bwc_cluster', deadlineMs: 1000, intervalMs: 0,
@@ -81,24 +81,59 @@ test('waitForClusterHealth resolves once every replica reports errors_count=0', 
   assert.equal(calls.length, 1);
   assert.match(calls[0].join(' '), /--format TSVRaw/);
   assert.match(calls[0].join(' '), /cluster = 'bwc_cluster'/);
+  // Every node's own selection state, not only the exec target's.
+  assert.match(calls[0].join(' '), /clusterAllReplicas\('bwc_cluster', system\.clusters\)/);
 });
 
 test('waitForClusterHealth retries until errors_count clears', async () => {
   const { capture, calls } = fakeCapture([
-    { status: 0, stdout: '0\t0\t3\n', stderr: '' }, // dirty — retries
-    { status: 0, stdout: '0\t0\t0\n', stderr: '' }, // clean — resolves
+    { status: 0, stdout: 'ch-0-0\t1\t1\t0\nch-0-1\t2\t1\t3\n', stderr: '' }, // another node dirty — retries
+    { status: 0, stdout: 'ch-0-0\t1\t1\t0\nch-0-1\t2\t1\t0\n', stderr: '' }, // clean — resolves
   ]);
   const kubectl = makeKubectl(capture, 'cerberus');
   await waitForClusterHealth(kubectl, 'chpod', {}, { cluster: 'bwc_cluster', deadlineMs: 1000, intervalMs: 0 });
   assert.equal(calls.length, 2);
 });
 
+test('waitForClusterHealth retries a failed poll query instead of exiting', async () => {
+  const { capture, calls } = fakeCapture([
+    { status: 1, stdout: '', stderr: 'Code: 279. DB::NetException: All connection tries failed' }, // peer not dialable yet
+    { status: 0, stdout: 'ch-0-0\t1\t1\t0\nch-0-1\t2\t1\t0\n', stderr: '' }, // clean — resolves
+  ]);
+  const kubectl = makeKubectl(capture, 'cerberus');
+  const elapsed = await waitForClusterHealth(kubectl, 'chpod', {}, { cluster: 'bwc_cluster', deadlineMs: 1000, intervalMs: 0 });
+  assert.ok(elapsed >= 0);
+  assert.equal(calls.length, 2);
+});
+
+test('waitForClusterHealth bounds each poll attempt with a capture timeout', async () => {
+  const seenOpts = [];
+  const capture = (cmd, args, opts) => {
+    seenOpts.push(opts);
+    return { status: 0, stdout: 'ch-0-0\t1\t1\t0\n', stderr: '' };
+  };
+  const { clusterHealthAttemptTimeoutMs } = await import('./k8s.mjs');
+  await waitForClusterHealth(makeKubectl(capture, 'cerberus'), 'chpod', {}, {
+    cluster: 'bwc_cluster', deadlineMs: 10 * clusterHealthAttemptTimeoutMs, intervalMs: 0,
+  });
+  assert.equal(seenOpts.length, 1);
+  assert.equal(seenOpts[0].timeout, clusterHealthAttemptTimeoutMs);
+});
+
+test('waitForClusterHealth reports the last query failure once deadlineMs elapses', async () => {
+  const capture = () => ({ status: 1, stdout: '', stderr: 'Code: 279. peer down' });
+  await assert.rejects(
+    () => waitForClusterHealth(makeKubectl(capture, 'cerberus'), 'chpod', {}, { cluster: 'bwc_cluster', deadlineMs: 15, intervalMs: 5 }),
+    /last poll query failed: Code: 279\. peer down/,
+  );
+});
+
 test('waitForClusterHealth rejects with dirty-row detail once deadlineMs elapses', async () => {
-  const capture = () => ({ status: 0, stdout: '0\t0\t7\n1\t0\t2\n', stderr: '' });
+  const capture = () => ({ status: 0, stdout: 'ch-0-0\t1\t1\t7\nch-0-1\t2\t1\t2\n', stderr: '' });
   const kubectl = makeKubectl(capture, 'cerberus');
   await assert.rejects(
     () => waitForClusterHealth(kubectl, 'chpod', {}, { cluster: 'bwc_cluster', deadlineMs: 15, intervalMs: 5 }),
-    /shard=0 replica=0 errors_count=7; shard=1 replica=0 errors_count=2/,
+    /node=ch-0-0 shard=1 replica=1 errors_count=7; node=ch-0-1 shard=2 replica=1 errors_count=2/,
   );
 });
 
