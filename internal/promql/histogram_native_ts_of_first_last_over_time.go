@@ -183,7 +183,7 @@ func lowerTsOfFirstLastOverExpHistogram(fn string, ms *parser.MatrixSelector, vs
 			[]chplan.Expr{histogramIdentityExpr(s)}, []string{s.AttributesColumn},
 			tsOfSampleTimestampAgg(fn, nil, s), s, ctx,
 		)
-		return tsOfRangeProjection(fn, fanout, s), nil
+		return tsOfRangeProjection(fn, fanout, s, ctx), nil
 	case gridBroadcast:
 		// Same split as [lowerTimestampOverExpHistogramBareSelector]'s own
 		// gridBroadcast arm: the pinned window is resolved ONCE via the
@@ -195,13 +195,13 @@ func lowerTsOfFirstLastOverExpHistogram(fn string, ms *parser.MatrixSelector, vs
 			return nil, err
 		}
 		grid := &chplan.StepGrid{Start: ctx.start.UTC(), End: ctx.end.UTC(), Step: ctx.step}
-		return tsOfRangeProjection(fn, &chplan.CrossJoin{Left: grid, Right: selected}, s), nil
+		return tsOfRangeProjection(fn, &chplan.CrossJoin{Left: grid, Right: selected}, s, ctx), nil
 	default:
 		selected, err := tsOfSampleTimestampSelected(fn, ms, vs, s, ctx)
 		if err != nil {
 			return nil, err
 		}
-		return tsOfInstantProjection(fn, selected, s), nil
+		return tsOfInstantProjection(fn, selected, s, ctx), nil
 	}
 }
 
@@ -236,8 +236,8 @@ func tsOfSampleTimestampSelected(fn string, ms *parser.MatrixSelector, vs *parse
 // neither is in [rangeFnPreservesName], so neither gets a raw-sample
 // timestamp column of its own), and the Value is the picked sample's own
 // timestamp as reference reports it ([tsOfValueExpr]).
-func tsOfInstantProjection(fn string, inner chplan.Node, s schema.Metrics) chplan.Node {
-	return tsOfSelectProjection(fn, nil, inner, chplan.NowNano(), s)
+func tsOfInstantProjection(fn string, inner chplan.Node, s schema.Metrics, ctx lowerCtx) chplan.Node {
+	return tsOfSelectProjection(fn, nil, inner, chplan.NowNano(), s, ctx)
 }
 
 // tsOfRangeProjection projects a RANGE-mode plan — either
@@ -247,8 +247,8 @@ func tsOfInstantProjection(fn string, inner chplan.Node, s schema.Metrics) chpla
 // along the matrix by its anchor, matching every other range-mode
 // exp-histogram consumer); the Value stays the picked sample's own
 // timestamp via [tsOfSampleTimestampAlias].
-func tsOfRangeProjection(fn string, inner chplan.Node, s schema.Metrics) chplan.Node {
-	return tsOfSelectProjection(fn, nil, inner, &chplan.ColumnRef{Name: stepGridAnchorColumn}, s)
+func tsOfRangeProjection(fn string, inner chplan.Node, s schema.Metrics, ctx lowerCtx) chplan.Node {
+	return tsOfSelectProjection(fn, nil, inner, &chplan.ColumnRef{Name: stepGridAnchorColumn}, s, ctx)
 }
 
 // tsOfSelectProjection is the shared cap [tsOfInstantProjection] /
@@ -260,7 +260,7 @@ func tsOfRangeProjection(fn string, inner chplan.Node, s schema.Metrics) chplan.
 // this pair's two hardcoded choices. fn and discriminator are the
 // reduction's own ([tsOfSampleTimestampAgg]), which [tsOfValueExpr]
 // reads back.
-func tsOfSelectProjection(fn string, discriminator *chplan.ColumnRef, inner chplan.Node, tsExpr chplan.Expr, s schema.Metrics) chplan.Node {
+func tsOfSelectProjection(fn string, discriminator *chplan.ColumnRef, inner chplan.Node, tsExpr chplan.Expr, s schema.Metrics, ctx lowerCtx) chplan.Node {
 	return &chplan.Project{
 		Roles: metricRoles(s),
 		Input: inner,
@@ -268,7 +268,7 @@ func tsOfSelectProjection(fn string, discriminator *chplan.ColumnRef, inner chpl
 			{Expr: &chplan.LitString{V: ""}, Alias: s.MetricNameColumn},
 			{Expr: &chplan.ColumnRef{Name: s.AttributesColumn}, Alias: s.AttributesColumn},
 			{Expr: tsExpr, Alias: s.TimestampColumn},
-			{Expr: tsOfValueExpr(fn, discriminator), Alias: s.ValueColumn},
+			{Expr: tsOfValueExpr(fn, discriminator, ctx), Alias: s.ValueColumn},
 		},
 	}
 }
@@ -284,10 +284,12 @@ func tsOfSelectProjection(fn string, discriminator *chplan.ColumnRef, inner chpl
 //     `if(<kinds> = 2, <ms>, greatest(<ms>, 0))` — the zero default takes
 //     part only where the window lacks one of the two kinds.
 //
-// Each is then reported as [millisSecondsValue]'s `toFloat64(<ms>) / 1000`,
+// The milliseconds are [lowerCtx.sampleMillis]'s, so a shifted frame's
+// shift is taken back before the floor. Each is then reported as
+// [millisSecondsValue]'s `toFloat64(<ms>) / 1000`,
 // Prometheus's `float64(t) / 1000`.
-func tsOfValueExpr(fn string, discriminator *chplan.ColumnRef) chplan.Expr {
-	millis := chplan.Expr(&chplan.FuncCall{Fn: chplan.FnToUnixMillis, Args: []chplan.Expr{&chplan.ColumnRef{Name: tsOfSampleTimestampAlias}}})
+func tsOfValueExpr(fn string, discriminator *chplan.ColumnRef, ctx lowerCtx) chplan.Expr {
+	millis := ctx.sampleMillis(&chplan.ColumnRef{Name: tsOfSampleTimestampAlias})
 	if fn != tsOfLastOverTimeExpHistFn {
 		return millisSecondsValue(millis)
 	}

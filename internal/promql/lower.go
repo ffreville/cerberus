@@ -53,7 +53,7 @@ func Lower(ctx context.Context, expr parser.Expr, s schema.Metrics) (chplan.Node
 		span.RecordError(err)
 		return nil, err
 	}
-	lctx.domain = domain
+	lctx = lctx.withDomain(domain)
 	plan, err := lowerRoot(expr, s, lctx)
 	if err != nil {
 		span.RecordError(err)
@@ -183,20 +183,29 @@ func LowerAtRangeOpts(ctx context.Context, expr parser.Expr, s schema.Metrics, s
 		tagGroups:              opts.TagGroups,
 		throwDuplicateSeriesIf: opts.ThrowDuplicateSeriesIf,
 	}
-	expr, domain, err := fitInstantDomain(expr, lctx)
+	plan, split, err := lowerRangeInParts(expr, s, lctx)
+	if !split {
+		plan, err = lowerFitted(expr, s, lctx)
+	}
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
-	lctx.domain = domain
-	plan, err := lowerRoot(expr, s, lctx)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-	plan = stampDistinctSampleRows(plan)
 	span.SetAttributes(cerbtrace.AttrPlanNodeCount.Int(cerbtrace.CountNodes(plan)))
 	return plan, nil
+}
+
+// lowerFitted fits expr at ctx ([fitInstantDomain]) and lowers it.
+func lowerFitted(expr parser.Expr, s schema.Metrics, ctx lowerCtx) (chplan.Node, error) {
+	expr, domain, err := fitInstantDomain(expr, ctx)
+	if err != nil {
+		return nil, err
+	}
+	plan, err := lowerRoot(expr, s, ctx.withDomain(domain))
+	if err != nil {
+		return nil, err
+	}
+	return stampDistinctSampleRows(plan), nil
 }
 
 // LowerMetadataRange lowers a bare metadata matcher (one match[] selector
@@ -258,7 +267,10 @@ func lowerRoot(expr parser.Expr, s schema.Metrics, ctx lowerCtx) (chplan.Node, e
 	if err := ctx.domain.checkBeyondRead(); err != nil {
 		return nil, err
 	}
-	return unshiftRootGrid(plan, expr, s, ctx), nil
+	if err := frameStorage(ctx.domain, append([]chplan.Node{plan}, ctx.guardPlans()...)...); err != nil {
+		return nil, ctx.domain.unframedErr
+	}
+	return unshiftRoot(plan, expr, s, ctx), nil
 }
 
 // lowerHistogramNativeRoot is [lowerRoot]'s histogram-native dispatch
@@ -3286,10 +3298,7 @@ func lowerRangeVectorCall(c *parser.Call, s schema.Metrics, ctx lowerCtx) (chpla
 		GroupBy:         []chplan.Expr{&chplan.ColumnRef{Name: s.AttributesColumn}},
 	}
 	rw.StartBeyond, rw.EndBeyond = ctx.domain.windowBeyond(ms)
-	if rw.StartBeyond == 0 && rw.EndBeyond == 0 {
-		// The DELTA-prefix aggregate and the downsample tier answer from
-		// bucket rows aligned to the window's own edges, which a cut
-		// window does not carry; the raw samples answer it alone.
+	if ctx.bucketRowsAnswer(rw) {
 		attachDeltaPrefixAggregateArm(rw, c.Func.Name, vs, s, temporalityCol, rangeCtx)
 		attachDownsampleTierArm(rw, c.Func.Name, vs, s, rangeCtx)
 	}

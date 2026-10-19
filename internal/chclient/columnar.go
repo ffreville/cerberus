@@ -199,13 +199,9 @@ func chPoolOptions(cfg Config) chpool.Options {
 	if cfg.DialTimeout > 0 {
 		opts.DialTimeout = cfg.DialTimeout
 	}
-	// ReadTimeout mirrors the row path's derivation: the explicit knob wins,
-	// else the per-query wall-clock budget bounds a stale half-open read.
-	switch {
-	case cfg.ReadTimeout > 0:
-		opts.ReadTimeout = cfg.ReadTimeout
-	case cfg.QueryTimeout > 0:
-		opts.ReadTimeout = cfg.QueryTimeout
+	// ReadTimeout is the row path's ceiling (socketReadTimeout).
+	if rt := socketReadTimeout(cfg); rt > 0 {
+		opts.ReadTimeout = rt
 	}
 	poolOpts := chpool.Options{ClientOptions: opts}
 	if cfg.MaxOpenConns > 0 {
@@ -491,6 +487,22 @@ type timeColumn interface {
 	Row(i int) time.Time
 }
 
+// millisColumn reads an Int64 TimeUnix column of Unix milliseconds, the
+// form a query reports a timestamp in when a DateTime64(9) cannot hold it.
+type millisColumn struct{ col *chproto.ColInt64 }
+
+func (m millisColumn) Row(i int) time.Time { return time.UnixMilli(m.col.Row(i)).UTC() }
+
+// sampleTimeColumn binds a result column as the TimeUnix of a sample: a
+// DateTime or DateTime64 column, or an Int64 column of Unix milliseconds.
+func sampleTimeColumn(col chproto.ColResult) (timeColumn, bool) {
+	if ms, ok := col.(*chproto.ColInt64); ok {
+		return millisColumn{col: ms}, true
+	}
+	ts, ok := col.(timeColumn)
+	return ts, ok
+}
+
 // bindColumns type-asserts the Auto-inferred result columns into the matrix
 // shape. A mismatch (wrong count, wrong names, wrong types — e.g. the Loki
 // log-stream projection, whose first column is `Line`) reports false so the
@@ -533,7 +545,7 @@ func (d *columnarCursor) bindColumns() (matrixCols, bool) {
 	if !ok {
 		return matrixCols{}, false
 	}
-	ts, ok := d.results[2].Data.(timeColumn)
+	ts, ok := sampleTimeColumn(d.results[2].Data)
 	if !ok {
 		return matrixCols{}, false
 	}

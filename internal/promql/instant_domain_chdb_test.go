@@ -30,7 +30,9 @@ const instantDomainMetric = "instant_domain_probe"
 // instantDomainSeed holds a sample just before instantDomainEval, one in
 // 1811, before the earliest instant a parsed DateTime64 string names, and
 // two minutes apart near each edge of the stored range: 2262-04-11 23:40
-// and 23:45 (job "edge"), 1677-09-21 00:20 and 00:25 (job "floor").
+// and 23:45 (job "edge"), 1677-09-21 00:20 and 00:25 (job "floor"), and
+// one at 1677-09-21 00:13 (job "first"), seventeen seconds after the
+// earliest stored instant.
 const instantDomainSeed = "" +
 	"CREATE TABLE otel_metrics_gauge (MetricName String, Attributes Map(String, String), TimeUnix DateTime64(9), Value Float64) " +
 	"ENGINE = MergeTree ORDER BY (MetricName, Attributes, TimeUnix);\n" +
@@ -40,7 +42,8 @@ const instantDomainSeed = "" +
 	"    ('" + instantDomainMetric + "', map('job', 'edge'), fromUnixTimestamp64Nano(toInt64(9223371600000000000)), 4.0),\n" +
 	"    ('" + instantDomainMetric + "', map('job', 'edge'), fromUnixTimestamp64Nano(toInt64(9223371900000000000)), 6.0),\n" +
 	"    ('" + instantDomainMetric + "', map('job', 'floor'), fromUnixTimestamp64Nano(toInt64(-9223371600000000000)), 5.0),\n" +
-	"    ('" + instantDomainMetric + "', map('job', 'floor'), fromUnixTimestamp64Nano(toInt64(-9223371300000000000)), 7.0);\n"
+	"    ('" + instantDomainMetric + "', map('job', 'floor'), fromUnixTimestamp64Nano(toInt64(-9223371300000000000)), 7.0),\n" +
+	"    ('" + instantDomainMetric + "', map('job', 'first'), fromUnixTimestamp64Nano(toInt64(-9223372020000000000)), 9.0);\n"
 
 var (
 	instantDomainEval = time.Date(2026, 1, 1, 0, 0, 1, 0, time.UTC)
@@ -50,6 +53,8 @@ var (
 	// ceiling, to which the API's request parsing clamps a request.
 	instantDomainNearFloor   = time.Date(1677, 9, 21, 0, 20, 0, 0, time.UTC)
 	instantDomainNearCeiling = time.Date(2262, 4, 11, 23, 46, 0, 0, time.UTC)
+	// instantDomainFirstSample is the job "first" sample's timestamp.
+	instantDomainFirstSample = time.Unix(-9223372020, 0).UTC()
 )
 
 // instantDomainRangeSteps is how many one-minute steps before the
@@ -62,6 +67,8 @@ const instantDomainRangeSteps = 2
 // instants and so is rejected there (TestInstantDomain_RangeStepMargin).
 var instantDomainInstantOnlyCases = map[string]bool{
 	"root_matrix_near_ceiling":               true,
+	"root_matrix_past_ceiling":               true,
+	"root_matrix_reads_past_ceiling":         true,
 	"root_matrix_read_at_year_one":           true,
 	"window_below_floor_at_request":          true,
 	"increase_window_below_floor_at_request": true,
@@ -85,16 +92,58 @@ func idConst(v float64) func(time.Time) float64 { return func(time.Time) float64
 // ending on a whole minute.
 func idStepSeconds(step time.Time) float64 { return float64(step.Unix()) }
 
+// idFloorRate is Prometheus's rate over the 15m window ending at step of
+// the job "floor" samples, 5 at 00:20 and 7 at 00:25: the increase of 2
+// over their 300s, extrapolated by half the 300s interval towards the
+// window's start, more than 330s away, and by the step's distance past
+// 00:25 towards its end, then divided by the window's 900s.
+func idFloorRate(step time.Time) float64 {
+	const (
+		sampled      = 300.0
+		toStartLimit = sampled / 2
+		increase     = 2.0
+		window       = 900.0
+	)
+	last := time.Unix(-9223371300, 0)
+	factor := (sampled + toStartLimit + step.Sub(last).Seconds()) / sampled / window
+	return increase * factor
+}
+
+// edgeGridRows is the answer of the job "edge" selector over the grid of
+// a 10m:1m subquery pinned at 2262-04-11 23:49, which reaches past the
+// last stored instant: at each minute from 23:40 the newest sample of its
+// lookback, 4 from 23:40 and 6 from 23:45.
+func edgeGridRows() []instantDomainRow {
+	const (
+		gridStart     = 9223371600
+		gridPoints    = 10
+		firstSampleOf = 5
+	)
+	rows := make([]instantDomainRow, 0, gridPoints)
+	for i := range gridPoints {
+		v := 4.0
+		if i >= firstSampleOf {
+			v = 6
+		}
+		rows = append(rows, instantDomainRow{
+			name: instantDomainMetric, labels: map[string]string{"job": "edge"}, at: idConst(v),
+			sampleAt: time.Unix(gridStart, 0).Add(time.Duration(i) * time.Minute).UTC(),
+		})
+	}
+	return rows
+}
+
 func idRow(labels map[string]string, at func(time.Time) float64) instantDomainRow {
 	return instantDomainRow{labels: labels, at: at}
 }
 
-// TestInstantDomainParity_ChDB pins cerberus issue #3824's shapes against
+// TestInstantDomainParity_ChDB pins the shapes of out-of-domain pins against
 // the Prometheus reference engine, with the answers written out by hand.
 func TestInstantDomainParity_ChDB(t *testing.T) {
 	noLabels := map[string]string{}
 	edge := map[string]string{"job": "edge"}
 	floor := map[string]string{"job": "floor"}
+	first := map[string]string{"job": "first"}
 	five := []instantDomainRow{idRow(noLabels, idConst(5))}
 	cases := []struct {
 		name  string
@@ -182,6 +231,14 @@ func TestInstantDomainParity_ChDB(t *testing.T) {
 			{labels: noLabels, at: idConst(1), sampleAt: time.UnixMilli(9223371960000).UTC()},
 			{labels: noLabels, at: idConst(1), sampleAt: time.UnixMilli(9223372020000).UTC()},
 		}},
+		// A root subquery whose grid leaves the stored range reports its
+		// instants as Unix milliseconds.
+		{name: "root_matrix_past_ceiling", query: `vector(1)[3m:1m] @ 10000000000`, eval: instantDomainEval, rows: []instantDomainRow{
+			{labels: noLabels, at: idConst(1), sampleAt: time.Unix(9999999840, 0).UTC()},
+			{labels: noLabels, at: idConst(1), sampleAt: time.Unix(9999999900, 0).UTC()},
+			{labels: noLabels, at: idConst(1), sampleAt: time.Unix(9999999960, 0).UTC()},
+		}},
+		{name: "root_matrix_reads_past_ceiling", query: instantDomainMetric + `{job="edge"}[10m:1m] @ 9223372140`, eval: instantDomainEval, rows: edgeGridRows()},
 		{name: "root_matrix_read_at_year_one", query: instantDomainMetric + `[5m] @ -62135596800`, eval: instantDomainEval},
 		// Windows reaching past the stored range read the samples inside
 		// it, for every function fixed by the samples a window holds.
@@ -267,6 +324,46 @@ func TestInstantDomainParity_ChDB(t *testing.T) {
 		{
 			"window_below_floor_at_request", `count_over_time(` + instantDomainMetric + `{job="floor"}[10m])`, instantDomainNearFloor,
 			[]instantDomainRow{idRow(floor, idConst(1))},
+		},
+		// A lookback or window reaching below the earliest stored instant
+		// from a request near it, read at one instant or at every step of
+		// a range.
+		{"selector_lookback_below_floor", instantDomainMetric + `{job="first"}`, instantDomainFirstSample.Add(2 * time.Minute), []instantDomainRow{{
+			name: instantDomainMetric, labels: first, at: idConst(9), sampleAt: instantDomainFirstSample,
+		}}},
+		{
+			"timestamp_lookback_below_floor", `timestamp(` + instantDomainMetric + `{job="first"})`, instantDomainFirstSample.Add(2 * time.Minute),
+			[]instantDomainRow{{labels: first, at: idConst(-9223372020), sampleAt: instantDomainFirstSample}},
+		},
+		{
+			"ts_of_max_window_below_floor", `ts_of_max_over_time(` + instantDomainMetric + `{job="first"}[10m])`, instantDomainFirstSample.Add(2 * time.Minute),
+			[]instantDomainRow{idRow(first, idConst(-9223372020))},
+		},
+		{
+			"windows_below_floor_at_every_step", `count_over_time(` + instantDomainMetric + `{job="floor"}[10m])`, instantDomainNearFloor.Add(2 * time.Minute),
+			[]instantDomainRow{idRow(floor, idConst(1))},
+		},
+		{
+			"rate_windows_below_floor_at_every_step", `rate(` + instantDomainMetric + `{job="floor"}[15m])`, instantDomainNearFloor.Add(7 * time.Minute),
+			[]instantDomainRow{idRow(floor, idFloorRate)},
+		},
+		// A subquery grid reaching past an edge that reads the stored
+		// samples inside it.
+		{
+			"subquery_reads_past_ceiling", `count_over_time(` + instantDomainMetric + `{job="edge"}[1h:1m] @ 9223373836.854)`, instantDomainEval,
+			[]instantDomainRow{idRow(edge, idConst(10))},
+		},
+		{
+			"subquery_timestamp_past_ceiling", `max_over_time(timestamp(` + instantDomainMetric + `{job="edge"})[1h:1m] @ 9223373836.854)`, instantDomainEval,
+			[]instantDomainRow{idRow(edge, idConst(9223371900))},
+		},
+		{
+			"subquery_reads_below_floor", `count_over_time(` + instantDomainMetric + `{job="floor"}[30m:1m] @ -9223371000)`, instantDomainNearFloor,
+			[]instantDomainRow{idRow(floor, idConst(10))},
+		},
+		{
+			"mixed_subquery_past_ceiling", `count_over_time((` + instantDomainMetric + `{job="edge"} or vector(1))[10m:1m] @ 9223372300)`, instantDomainEval,
+			[]instantDomainRow{idRow(noLabels, idConst(10)), idRow(edge, idConst(8))},
 		},
 		// Requests near the bounds, where the unpinned grid leaves the
 		// range.
@@ -370,6 +467,14 @@ func instantDomainCells(t *testing.T, seed, sql string, args []any, want []insta
 	if err != nil {
 		t.Fatalf("result columns: %v", err)
 	}
+	// A root reports an instant no DateTime64(9) holds as Int64 Unix
+	// milliseconds.
+	millis := false
+	if slices.Contains(cols, "TimeUnix") {
+		var typ string
+		err := db.QueryRow("SELECT toTypeName(`TimeUnix`) FROM ("+q+") LIMIT 1", a...).Scan(&typ)
+		millis = err == nil && typ == "Int64"
+	}
 	if slices.Contains(cols, "anchor_ts") && slices.Contains(cols, "TimeUnix") {
 		cols = slices.DeleteFunc(cols, func(c string) bool { return c == "anchor_ts" })
 		sql = "SELECT `" + strings.Join(cols, "`, `") + "` FROM (" + sql + ")"
@@ -390,6 +495,12 @@ func instantDomainCells(t *testing.T, seed, sql string, args []any, want []insta
 					cell = append(cell, r.labels)
 				case "Value":
 					cell = append(cell, r.at(at))
+				case "TimeUnix":
+					if millis {
+						cell = append(cell, ts.UnixMilli())
+					} else {
+						cell = append(cell, ts.Format(time.RFC3339Nano))
+					}
 				default:
 					cell = append(cell, ts.Format(time.RFC3339Nano))
 				}
@@ -398,4 +509,61 @@ func instantDomainCells(t *testing.T, seed, sql string, args []any, want []insta
 		}
 	}
 	return sql, cells
+}
+
+// TestInstantDomainParity_RangeSpanningTheDomain_ChDB pins, against the
+// Prometheus reference engine, a range query whose steps span the whole
+// stored range: its first step's lookback reaches below the earliest
+// stored instant and its last step sits a minute before the latest one,
+// so no one shift of its instants fits, and each half of its steps is
+// answered in a frame of its own.
+func TestInstantDomainParity_RangeSpanningTheDomain_ChDB(t *testing.T) {
+	const fixturePermissions = 0o600
+	query := instantDomainMetric + `{job=~"first|edge"}`
+	start := instantDomainFirstSample.Add(2 * time.Minute)
+	end := instantDomainNearCeiling
+	// Ten thousand steps of about 21 days, under Prometheus's limit of
+	// 11000 points a series, land the last one exactly at end.
+	const steps = 10000
+	step := time.Duration((end.UnixMilli()-start.UnixMilli())/steps) * time.Millisecond
+	if start.UnixMilli()+steps*step.Milliseconds() != end.UnixMilli() {
+		t.Fatalf("%d steps of %s from %s miss %s", steps, step, start, end)
+	}
+	expr, err := parser.NewParser(parser.Options{}).ParseExpr(query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := promql.LowerAtRange(context.Background(), expr, schema.DefaultOTelMetrics(), start, end, step)
+	if err != nil {
+		t.Fatalf("LowerAtRange(%q): %v", query, err)
+	}
+	plan = spec.AssertScanTimeBoundAccepts(t, plan)
+	sql, args, err := chsql.Emit(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cells := [][]any{
+		{instantDomainMetric, map[string]string{"job": "first"}, start.Format(time.RFC3339Nano), 9.0},
+		{instantDomainMetric, map[string]string{"job": "edge"}, end.Format(time.RFC3339Nano), 6.0},
+	}
+	expected, err := json.Marshal(cells)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := &txtar.Archive{Files: []txtar.File{
+		{Name: "query.promql", Data: []byte(query + "\n")},
+		{Name: "parity", Data: []byte("oracle: prometheus\nendpoint: /api/v1/query_range\nscope: full\n")},
+		{Name: "seed", Data: []byte(instantDomainSeed)},
+		{Name: "expected_rows", Data: expected},
+	}}
+	path := filepath.Join(t.TempDir(), "instant_domain_span.txtar")
+	if err := os.WriteFile(path, txtar.Format(archive), fixturePermissions); err != nil {
+		t.Fatal(err)
+	}
+	fixture, err := spec.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual := spec.RunRoundTripSQL(t, fixture, sql, args)
+	spec.RunParity(t, fixture, spec.ParityEval{Start: start, End: end, Step: step}, actual)
 }

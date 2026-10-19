@@ -28,11 +28,23 @@ const maxDurationMillis = int64(math.MaxInt64 / time.Millisecond)
 const emptyVectorThreshold = -1
 
 // instantDomainError rejects a query that needs the instant t, which lies
-// outside the instant domain.
+// outside the instant domain. The message is built here, as a fmt.Errorf
+// call, so the rejection-parity catalogue finds the site.
 func instantDomainError(t time.Time) error {
-	return fmt.Errorf("promql: the query needs instant %s, outside the range cerberus supports (%s to %s): ClickHouse cannot represent it exactly",
-		t.UTC().Format(time.RFC3339Nano), instantDomainMin.Format(time.RFC3339Nano), instantDomainMax.Format(time.RFC3339Nano))
+	t = t.UTC()
+	return &outsideDomainError{at: t, err: fmt.Errorf("promql: the query needs instant %s, outside the range cerberus supports (%s to %s): ClickHouse cannot represent it exactly",
+		t.Format(time.RFC3339Nano), instantDomainMin.Format(time.RFC3339Nano), instantDomainMax.Format(time.RFC3339Nano))}
 }
+
+// outsideDomainError is the rejection [instantDomainError] returns.
+type outsideDomainError struct {
+	// at is the instant outside the domain the query needs.
+	at time.Time
+	// err carries the message.
+	err error
+}
+
+func (e *outsideDomainError) Error() string { return e.err.Error() }
 
 // domainEnv is the span of instants one expression is evaluated at.
 type domainEnv struct {
@@ -56,6 +68,9 @@ type domainEnv struct {
 	// empty. pin is that pin's own instant.
 	wrapped bool
 	pin     time.Time
+	// frame is how far the instants of env lie after the instants
+	// Prometheus evaluates at ([fitInFrame]).
+	frame time.Duration
 	// inSubquery reports that the expression is evaluated on the grid of
 	// an enclosing subquery.
 	inSubquery bool
@@ -84,16 +99,30 @@ type domainFit struct {
 	// a function reads by its matchers (absent, info's second argument),
 	// which must stay a selector ([cutSelector]).
 	keepSelectors bool
+	// frameShift is the shift, in milliseconds, of the frame the whole
+	// query is fitted and lowered in, zero when it is Prometheus's own
+	// ([fitInFrame]).
+	frameShift int64
+	// unframedErr is the rejection the query raises in Prometheus's own
+	// frame, which a lowering in the shifted frame that cannot answer the
+	// query returns.
+	unframedErr error
 }
 
-// shiftOf returns the time shift recorded for node, and whether one is.
+// shiftOf returns the time shift node is lowered with, the shift of its
+// region on top of the query's frame, and whether either is recorded.
 func (f *domainFit) shiftOf(node parser.Node) (int64, bool) {
 	if f == nil {
 		return 0, false
 	}
 	shift, ok := f.shifts[node]
-	return shift, ok
+	return shift + f.frameShift, ok || f.frameShift != 0
 }
+
+// cutsStorage reports whether the fit cuts windows back to the stored
+// range. A shifted frame does not: its instants are not those a storage
+// column holds.
+func (f *domainFit) cutsStorage() bool { return f.frameShift == 0 }
 
 // gridShift returns the time shift of the grid of subquery sub, zero
 // when its grid is not shifted. It is looked up by sub's inner expression,
@@ -137,7 +166,13 @@ func (f *domainFit) readsNothing(vs *parser.VectorSelector) bool {
 // rejected with [instantDomainError]. expr itself is never modified: a
 // rewritten node is a copy.
 func fitInstantDomain(expr parser.Expr, ctx lowerCtx) (parser.Expr, *domainFit, error) {
-	env := domainEnv{start: ctx.start, end: ctx.end, step: ctx.step}
+	return fitInFrame(expr, ctx)
+}
+
+// fitDomain fits expr at ctx, whose instants lie frameShift milliseconds
+// after Prometheus's own ([fitInFrame]).
+func fitDomain(expr parser.Expr, ctx lowerCtx, frameShift int64) (parser.Expr, *domainFit, error) {
+	env := domainEnv{start: ctx.start, end: ctx.end, step: ctx.step, frame: time.Duration(frameShift) * time.Millisecond}
 	if !ctx.end.IsZero() {
 		env.known = true
 		env.lo, env.hi = ctx.end, ctx.end
@@ -151,7 +186,7 @@ func fitInstantDomain(expr parser.Expr, ctx lowerCtx) (parser.Expr, *domainFit, 
 		env.ev = promEval{start: start, offEval: start, req: &[2]int64{start, promTimeMilliseconds(ctx.end)}}
 		env.hasEv = true
 	}
-	f := &domainFit{}
+	f := &domainFit{frameShift: frameShift}
 	out, res := f.fitReplacing(expr, env)
 	if res.rejected() && res.empty && out.Type() == parser.ValueTypeMatrix {
 		out, res = emptyRangeVector(), fitResult{empty: true}
@@ -160,7 +195,7 @@ func fitInstantDomain(expr parser.Expr, ctx lowerCtx) (parser.Expr, *domainFit, 
 		res.err = res.outside
 	}
 	if res.err == nil {
-		res.err = f.checkRootGrid(out)
+		f.recordRootGrid(out, env)
 	}
 	if res.err != nil {
 		return nil, nil, res.err
@@ -198,20 +233,43 @@ func rootSubquery(e parser.Expr) *parser.SubqueryExpr {
 	}
 }
 
-// checkRootGrid rejects a query whose root is a shifted subquery whose
-// grid instants, which it answers as sample timestamps, lie outside the
-// domain, or whose shift a nanosecond Interval cannot carry back
-// ([unshiftRootGrid]).
-func (f *domainFit) checkRootGrid(root parser.Expr) error {
+// rootGridInDomain reports whether root, the fitted query, answers
+// timestamps a DateTime64(9) holds: it is not a shifted subquery, or the
+// instants of its grid, which it answers as sample timestamps, lie in the
+// domain in Prometheus's frame.
+func (f *domainFit) rootGridInDomain(root parser.Expr) bool {
+	if f == nil {
+		return true
+	}
 	sub := rootSubquery(root)
 	grid, ok := f.grids[sub]
-	if !ok {
-		return nil
+	if sub == nil || !ok {
+		return true
 	}
-	if shift := f.shifts[sub]; !offsetFits(shift) {
-		return instantDomainError(grid[1])
+	frame := time.Duration(f.frameShift) * time.Millisecond
+	return checkInstantDomain(grid[0].Add(-frame), grid[1].Add(-frame), 0, 0) == nil
+}
+
+// recordRootGrid records the grid of root, the fitted query, when root is
+// a subquery lowered in a shifted frame that no region shift recorded:
+// such a root answers its grid instants, which [domainFit.rootGridInDomain]
+// judges in Prometheus's frame.
+func (f *domainFit) recordRootGrid(root parser.Expr, env domainEnv) {
+	sub := rootSubquery(root)
+	if f.frameShift == 0 || sub == nil {
+		return
 	}
-	return checkInstantDomain(grid[0], grid[1], 0, 0)
+	if _, ok := f.grids[sub]; ok {
+		return
+	}
+	at, _ := pinnedEnv(sub.Timestamp, sub.StartOrEnd, sub.OriginalOffset, env)
+	if !at.known {
+		return
+	}
+	if f.grids == nil {
+		f.grids = map[*parser.SubqueryExpr][2]time.Time{}
+	}
+	f.grids[sub] = gridSpan(at, sub.Range, sub.Step)
 }
 
 // promTimeMilliseconds is Prometheus's timeMilliseconds.
@@ -226,7 +284,7 @@ func checkInstantDomain(lo, hi time.Time, reach, margin time.Duration) error {
 	switch {
 	case lo.Before(instantDomainMin):
 		return instantDomainError(lo)
-	case lo.Add(-reach - margin).Before(instantDomainMin):
+	case lo.Add(-reach).Add(-margin).Before(instantDomainMin):
 		return instantDomainError(lo.Add(-reach))
 	case hi.Add(margin).After(instantDomainMax):
 		return instantDomainError(hi)
@@ -370,7 +428,7 @@ func (f *domainFit) fitReplacing(e parser.Expr, env domainEnv) (parser.Expr, fit
 func (f *domainFit) fitExpr(e parser.Expr, env domainEnv) (parser.Expr, fitResult) {
 	switch n := e.(type) {
 	case *parser.VectorSelector:
-		if cut, ok := cutSelector(n, env); ok && !f.keepSelectors {
+		if cut, ok := cutSelector(n, env); ok && !f.keepSelectors && f.cutsStorage() {
 			return f.fitExpr(cut, env)
 		}
 		at, _ := pinnedEnv(n.Timestamp, n.StartOrEnd, n.OriginalOffset, env)
@@ -441,7 +499,7 @@ func fitWindow(env domainEnv, reach time.Duration, ownPin bool) fitResult {
 	if err == nil {
 		return fitResult{reads: !ownPin}
 	}
-	return fitResult{empty: outsideStorage(env.lo.Add(-reach), env.hi), err: err}
+	return fitResult{empty: outsideStorage(env.lo.Add(-reach-env.frame), env.hi.Add(-env.frame)), err: err}
 }
 
 func (f *domainFit) fitSubquery(n *parser.SubqueryExpr, env domainEnv) (parser.Expr, fitResult) {
@@ -723,7 +781,7 @@ func absentSelector(n *parser.Call) (*parser.VectorSelector, parser.Expr, bool) 
 }
 
 func (f *domainFit) fitCall(n *parser.Call, env domainEnv) (parser.Expr, fitResult) {
-	if vs, ok := unwrapParens(firstArg(n)).(*parser.VectorSelector); ok && n.Func.Name == "absent" {
+	if vs, ok := unwrapParens(firstArg(n)).(*parser.VectorSelector); ok && n.Func.Name == "absent" && f.cutsStorage() {
 		// absent(v) answers exactly when v's lookback holds no sample, as
 		// absent_over_time(v[lookback]) does, whose window can be cut.
 		if cut, _, ok := cutMatrix(&parser.MatrixSelector{VectorSelector: vs, Range: instantLookback}, env); ok {

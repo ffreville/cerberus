@@ -237,6 +237,7 @@ func lowerSelectFnOverExpHistogramSubqueryInput(input chplan.Node, sub *parser.S
 			&chplan.CrossJoin{Left: grid, Right: windowed},
 			&chplan.ColumnRef{Name: stepGridAnchorColumn},
 			histSchema,
+			ctx,
 		), nil
 	}
 	if ctx.rangeMode() {
@@ -247,7 +248,7 @@ func lowerSelectFnOverExpHistogramSubqueryInput(input chplan.Node, sub *parser.S
 	if anchor.anchored() {
 		tsExpr = windowRightBoundExpr(anchorAt(anchor.End()))
 	}
-	return capSelectFnOverSubquery(windowFn, discriminator, windowed, tsExpr, histSchema), nil
+	return capSelectFnOverSubquery(windowFn, discriminator, windowed, tsExpr, histSchema, ctx), nil
 }
 
 // selectFnOverSubqueryWindowed builds the instant-mode (and pinned-broadcast,
@@ -408,9 +409,9 @@ func lowerSelectFnOverSubqueryRange(windowFn string, input chplan.Node, discrimi
 	}
 	switch windowFn {
 	case lastOverTimeWindowFn, firstOverTimeWindowFn:
-		return capSelectFnOverSubquery(windowFn, discriminator, fanout(nativeExpHistValuedLatestAggsDirectional(windowFn, s)), anchorRef, s)
+		return capSelectFnOverSubquery(windowFn, discriminator, fanout(nativeExpHistValuedLatestAggsDirectional(windowFn, s)), anchorRef, s, ctx)
 	case countOverTimeWindowFn, presentOverTimeWindowFn:
-		return capSelectFnOverSubquery(windowFn, discriminator, fanout([]chplan.AggFunc{expHistogramCountPresentValueAgg(windowFn, s)}), anchorRef, s)
+		return capSelectFnOverSubquery(windowFn, discriminator, fanout([]chplan.AggFunc{expHistogramCountPresentValueAgg(windowFn, s)}), anchorRef, s, ctx)
 	case resetsWindowFn, changesWindowFn:
 		perSeries := expHistogramPairCountStage(
 			fanout(expHistogramPairCountAggs(windowFn, s)),
@@ -418,7 +419,7 @@ func lowerSelectFnOverSubqueryRange(windowFn string, input chplan.Node, discrimi
 		)
 		return expHistogramPairCountProjection(perSeries, anchorRef, s)
 	default: // tsOfFirstOverTimeExpHistFn, tsOfLastOverTimeExpHistFn
-		return capSelectFnOverSubquery(windowFn, discriminator, fanout(tsOfSampleTimestampAgg(windowFn, discriminator, s)), anchorRef, s)
+		return capSelectFnOverSubquery(windowFn, discriminator, fanout(tsOfSampleTimestampAgg(windowFn, discriminator, s)), anchorRef, s, ctx)
 	}
 }
 
@@ -433,7 +434,7 @@ func lowerSelectFnOverSubqueryRange(windowFn string, input chplan.Node, discrimi
 // dropped) for the two ts_of_* siblings. discriminator is the reduced
 // relation's own ([mixedDiscriminator]), which only the ts_of_* projection
 // reads ([tsOfValueExpr]).
-func capSelectFnOverSubquery(windowFn string, discriminator *chplan.ColumnRef, input chplan.Node, tsExpr chplan.Expr, s schema.Metrics) chplan.Node {
+func capSelectFnOverSubquery(windowFn string, discriminator *chplan.ColumnRef, input chplan.Node, tsExpr chplan.Expr, s schema.Metrics, ctx lowerCtx) chplan.Node {
 	if !selectFnDropsSeriesName(windowFn) {
 		return nativeHistogramProjection(input, bareExpHistogramNameExpr(s), tsExpr, s)
 	}
@@ -443,6 +444,6 @@ func capSelectFnOverSubquery(windowFn string, discriminator *chplan.ColumnRef, i
 	case resetsWindowFn, changesWindowFn:
 		return expHistogramPairCountProjection(input, tsExpr, s)
 	default: // tsOfFirstOverTimeExpHistFn, tsOfLastOverTimeExpHistFn
-		return tsOfSelectProjection(windowFn, discriminator, input, tsExpr, s)
+		return tsOfSelectProjection(windowFn, discriminator, input, tsExpr, s, ctx)
 	}
 }
