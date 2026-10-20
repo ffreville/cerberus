@@ -32,11 +32,11 @@ conformance **ledger** in [`test/surface-parity/`](../test/surface-parity/)
 ([Layer 6d](test-strategy.md#layer-6d--function-surface-parity-ledger) of the
 test map). The ledger classifies each symbol four ways — `parity-accept`,
 `parity-reject`, `wrong-reject`, `wrong-accept` — which is the right vocabulary
-for the test ratchet but the wrong one for a reader: `range()` / `step()` read
-as "wrong-accept" in the ledger — the probe drives them as bare top-level
-calls, a shape the reference rejects for query-context reasons — yet they are
-genuinely **Supported (experimental)** for a user. The table above performs
-that translation.
+for the test ratchet but the wrong one for a reader: `start()` / `end()` /
+`range()` / `step()` read as "wrong-accept" in the ledger (see
+[the note on the query-context functions](#a-note-on-the-promql-query-context-functions))
+yet they are genuinely **Supported (experimental)** for a user. The table above
+performs that translation.
 
 The ledger is **symbol-level**: it records whether cerberus accepts a symbol at
 all, not which argument *shapes* of that symbol it accepts. A function listed
@@ -61,17 +61,18 @@ figure here can only ever be what the ledger tallies.
 
 | Head      | Symbols probed | Supported (incl. experimental) | Intentionally rejected (parity) | Wrong-rejected symbols |
 | --------- | -------------- | ------------------------------ | ------------------------------- | ---------------------- |
-| PromQL    | 121            | 119                            | 2                               | 0                      |
+| PromQL    | 121            | 121                            | 0                               | 0                      |
 | LogQL     | 62             | 62                             | 0                               | 0                      |
 | TraceQL   | 45             | 45                             | 0                               | 0                      |
-| **Total** | **228**        | **226**                        | **2**                           | **0**                  |
+| **Total** | **228**        | **228**                        | **0**                           | **0**                  |
 
 <!-- END AUTOGEN: coverage-glance -->
 
-> **This is an accept/reject ledger, not a correctness score.** "226/228
-> supported" means cerberus *lowers to SQL that the reference also accepts*
-> for 226 of 228 grammar symbols. It does **not** mean those 226 symbols
-> return numerically correct rows — that is what the
+> **This is an accept/reject ledger, not a correctness score.** "228/228
+> supported" means cerberus *lowers to SQL* all 228 grammar symbols, each one
+> the reference also accepts or a
+> [query-context function](#a-note-on-the-promql-query-context-functions). It
+> does **not** mean those 228 symbols return numerically correct rows — that is what the
 > [differential harnesses](compatibility.md) measure (an accepted symbol
 > can still emit wrong rows). Cite this number as **surface / rejection
 > parity**, never as numerical correctness coverage.
@@ -117,20 +118,30 @@ Read the two measurements together, never one for the other: every grammar
 symbol lowers, and a counted, individually-tracked set of argument shapes and
 instants does not.
 
-The two PromQL parity rejections are the bare `start()` / `end()`
-query-context calls, which the reference parser itself only admits inside an `@` modifier (`up @ start()`,
-`up @ end()` — both **Supported**, listed under Modifiers) and rejects as
-standalone expressions exactly as cerberus does.
+### A note on the PromQL query-context functions
 
-### A note on PromQL `range()` / `step()`
+`start()`, `end()`, `range()` and `step()` are experimental upstream and
+**Supported** in cerberus. Cerberus folds each to a constant once per query,
+wherever it sits (at the root, as a scalar argument, inside a subquery), exactly
+as `foldQueryContextFunctions` does in the Prometheus engine library its parser
+and test oracle come from:
 
-These two query-context functions are experimental upstream and **Supported**
-in cerberus: it constant-folds them per query exactly as the reference engine
-does (`range()` → eval-range seconds, `step()` → the query_range step). They
-appear as a `cerberus extension` in the raw ledger only because the
-surface-parity probe drives them as bare top-level calls, a form the HTTP
-reference rejects outside a query context — an artifact of the probe shape,
-not a correctness divergence. In real PromQL usage they match upstream.
+| Function  | Instant query at `t` | Range query over `[start, end]` |
+| --------- | -------------------- | ------------------------------- |
+| `start()` | `t`                  | `start`                         |
+| `end()`   | `t`                  | `end`                           |
+| `range()` | `0`                  | `end - start`                   |
+| `step()`  | `0`                  | the query_range step            |
+
+Every value is in seconds. `start()` and `end()` are Unix times truncated to
+whole milliseconds.
+
+The surface-parity reference is the released `prom/prometheus:v3.11.3` server,
+whose grammar predates these four functions: it rejects a bare `start()` /
+`end()` as a parse error and parses `range()` / `step()` as duration
+expressions it cannot evaluate at the top level. That is why the raw ledger
+records all four as `wrong-accept`. The `@ start()` / `@ end()` modifiers are a
+separate construct, **Supported** by both, and listed under Modifiers.
 
 ## Per-symbol tables
 
@@ -169,95 +180,95 @@ The `Probe` column is the exact query the ledger evaluates for that symbol.
 
 #### Functions
 
-| Symbol                         | Probe                                                                            | Status                           |
-| ------------------------------ | -------------------------------------------------------------------------------- | -------------------------------- |
-| `abs`                          | `abs(up)`                                                                        | Supported                        |
-| `absent`                       | `absent(up)`                                                                     | Supported                        |
-| `absent_over_time`             | `absent_over_time(up[5m])`                                                       | Supported                        |
-| `acos`                         | `acos(up)`                                                                       | Supported                        |
-| `acosh`                        | `acosh(up)`                                                                      | Supported                        |
-| `asin`                         | `asin(up)`                                                                       | Supported                        |
-| `asinh`                        | `asinh(up)`                                                                      | Supported                        |
-| `atan`                         | `atan(up)`                                                                       | Supported                        |
-| `atanh`                        | `atanh(up)`                                                                      | Supported                        |
-| `avg_over_time`                | `avg_over_time(up[5m])`                                                          | Supported                        |
-| `ceil`                         | `ceil(up)`                                                                       | Supported                        |
-| `changes`                      | `changes(http_server_request_duration_count[5m])`                                | Supported                        |
-| `clamp`                        | `clamp(up, 0.5, 0.5)`                                                            | Supported                        |
-| `clamp_max`                    | `clamp_max(up, 0.5)`                                                             | Supported                        |
-| `clamp_min`                    | `clamp_min(up, 0.5)`                                                             | Supported                        |
-| `cos`                          | `cos(up)`                                                                        | Supported                        |
-| `cosh`                         | `cosh(up)`                                                                       | Supported                        |
-| `count_over_time`              | `count_over_time(up[5m])`                                                        | Supported                        |
-| `day_of_month`                 | `day_of_month(up)`                                                               | Supported                        |
-| `day_of_week`                  | `day_of_week(up)`                                                                | Supported                        |
-| `day_of_year`                  | `day_of_year(up)`                                                                | Supported                        |
-| `days_in_month`                | `days_in_month(up)`                                                              | Supported                        |
-| `deg`                          | `deg(up)`                                                                        | Supported                        |
-| `delta`                        | `delta(http_server_request_duration_count[5m])`                                  | Supported                        |
-| `deriv`                        | `deriv(http_server_request_duration_count[5m])`                                  | Supported                        |
-| `double_exponential_smoothing` | `double_exponential_smoothing(http_server_request_duration_count[5m], 0.5, 0.5)` | Supported (experimental)         |
-| `end`                          | `end()`                                                                          | Rejected (parity with reference) |
-| `exp`                          | `exp(up)`                                                                        | Supported                        |
-| `first_over_time`              | `first_over_time(up[5m])`                                                        | Supported (experimental)         |
-| `floor`                        | `floor(up)`                                                                      | Supported                        |
-| `histogram_avg`                | `histogram_avg(showcase_latency_exp_hist)`                                       | Supported                        |
-| `histogram_count`              | `histogram_count(showcase_latency_exp_hist)`                                     | Supported                        |
-| `histogram_fraction`           | `histogram_fraction(0, 1, showcase_latency_exp_hist)`                            | Supported                        |
-| `histogram_quantile`           | `histogram_quantile(0.9, showcase_latency_exp_hist)`                             | Supported                        |
-| `histogram_quantiles`          | `histogram_quantiles(showcase_latency_exp_hist, "q", 0.5, 0.9)`                  | Supported (experimental)         |
-| `histogram_stddev`             | `histogram_stddev(showcase_latency_exp_hist)`                                    | Supported                        |
-| `histogram_stdvar`             | `histogram_stdvar(showcase_latency_exp_hist)`                                    | Supported                        |
-| `histogram_sum`                | `histogram_sum(showcase_latency_exp_hist)`                                       | Supported                        |
-| `hour`                         | `hour(up)`                                                                       | Supported                        |
-| `idelta`                       | `idelta(http_server_request_duration_count[5m])`                                 | Supported                        |
-| `increase`                     | `increase(http_server_request_duration_count[5m])`                               | Supported                        |
-| `info`                         | `info(http_server_request_duration_count)`                                       | Supported (experimental)         |
-| `irate`                        | `irate(http_server_request_duration_count[5m])`                                  | Supported                        |
-| `label_join`                   | `label_join(up, "dst", ",", "job")`                                              | Supported                        |
-| `label_replace`                | `label_replace(up, "dst", "$1", "job", "(.*)")`                                  | Supported                        |
-| `last_over_time`               | `last_over_time(up[5m])`                                                         | Supported                        |
-| `ln`                           | `ln(up)`                                                                         | Supported                        |
-| `log10`                        | `log10(up)`                                                                      | Supported                        |
-| `log2`                         | `log2(up)`                                                                       | Supported                        |
-| `mad_over_time`                | `mad_over_time(up[5m])`                                                          | Supported (experimental)         |
-| `max_over_time`                | `max_over_time(up[5m])`                                                          | Supported                        |
-| `min_over_time`                | `min_over_time(up[5m])`                                                          | Supported                        |
-| `minute`                       | `minute(up)`                                                                     | Supported                        |
-| `month`                        | `month(up)`                                                                      | Supported                        |
-| `pi`                           | `pi()`                                                                           | Supported                        |
-| `predict_linear`               | `predict_linear(http_server_request_duration_count[5m], 0.5)`                    | Supported                        |
-| `present_over_time`            | `present_over_time(up[5m])`                                                      | Supported                        |
-| `quantile_over_time`           | `quantile_over_time(0.5, up[5m])`                                                | Supported                        |
-| `rad`                          | `rad(up)`                                                                        | Supported                        |
-| `range`                        | `range()`                                                                        | Supported (experimental)         |
-| `rate`                         | `rate(http_server_request_duration_count[5m])`                                   | Supported                        |
-| `resets`                       | `resets(http_server_request_duration_count[5m])`                                 | Supported                        |
-| `round`                        | `round(up, 0.5)`                                                                 | Supported                        |
-| `scalar`                       | `scalar(up)`                                                                     | Supported                        |
-| `sgn`                          | `sgn(up)`                                                                        | Supported                        |
-| `sin`                          | `sin(up)`                                                                        | Supported                        |
-| `sinh`                         | `sinh(up)`                                                                       | Supported                        |
-| `sort`                         | `sort(up)`                                                                       | Supported                        |
-| `sort_by_label`                | `sort_by_label(up, "s")`                                                         | Supported (experimental)         |
-| `sort_by_label_desc`           | `sort_by_label_desc(up, "s")`                                                    | Supported (experimental)         |
-| `sort_desc`                    | `sort_desc(up)`                                                                  | Supported                        |
-| `sqrt`                         | `sqrt(up)`                                                                       | Supported                        |
-| `start`                        | `start()`                                                                        | Rejected (parity with reference) |
-| `stddev_over_time`             | `stddev_over_time(up[5m])`                                                       | Supported                        |
-| `stdvar_over_time`             | `stdvar_over_time(up[5m])`                                                       | Supported                        |
-| `step`                         | `step()`                                                                         | Supported (experimental)         |
-| `sum_over_time`                | `sum_over_time(up[5m])`                                                          | Supported                        |
-| `tan`                          | `tan(up)`                                                                        | Supported                        |
-| `tanh`                         | `tanh(up)`                                                                       | Supported                        |
-| `time`                         | `time()`                                                                         | Supported                        |
-| `timestamp`                    | `timestamp(up)`                                                                  | Supported                        |
-| `ts_of_first_over_time`        | `ts_of_first_over_time(up[5m])`                                                  | Supported (experimental)         |
-| `ts_of_last_over_time`         | `ts_of_last_over_time(up[5m])`                                                   | Supported (experimental)         |
-| `ts_of_max_over_time`          | `ts_of_max_over_time(up[5m])`                                                    | Supported (experimental)         |
-| `ts_of_min_over_time`          | `ts_of_min_over_time(up[5m])`                                                    | Supported (experimental)         |
-| `vector`                       | `vector(0.5)`                                                                    | Supported                        |
-| `year`                         | `year(up)`                                                                       | Supported                        |
+| Symbol                         | Probe                                                                            | Status                   |
+| ------------------------------ | -------------------------------------------------------------------------------- | ------------------------ |
+| `abs`                          | `abs(up)`                                                                        | Supported                |
+| `absent`                       | `absent(up)`                                                                     | Supported                |
+| `absent_over_time`             | `absent_over_time(up[5m])`                                                       | Supported                |
+| `acos`                         | `acos(up)`                                                                       | Supported                |
+| `acosh`                        | `acosh(up)`                                                                      | Supported                |
+| `asin`                         | `asin(up)`                                                                       | Supported                |
+| `asinh`                        | `asinh(up)`                                                                      | Supported                |
+| `atan`                         | `atan(up)`                                                                       | Supported                |
+| `atanh`                        | `atanh(up)`                                                                      | Supported                |
+| `avg_over_time`                | `avg_over_time(up[5m])`                                                          | Supported                |
+| `ceil`                         | `ceil(up)`                                                                       | Supported                |
+| `changes`                      | `changes(http_server_request_duration_count[5m])`                                | Supported                |
+| `clamp`                        | `clamp(up, 0.5, 0.5)`                                                            | Supported                |
+| `clamp_max`                    | `clamp_max(up, 0.5)`                                                             | Supported                |
+| `clamp_min`                    | `clamp_min(up, 0.5)`                                                             | Supported                |
+| `cos`                          | `cos(up)`                                                                        | Supported                |
+| `cosh`                         | `cosh(up)`                                                                       | Supported                |
+| `count_over_time`              | `count_over_time(up[5m])`                                                        | Supported                |
+| `day_of_month`                 | `day_of_month(up)`                                                               | Supported                |
+| `day_of_week`                  | `day_of_week(up)`                                                                | Supported                |
+| `day_of_year`                  | `day_of_year(up)`                                                                | Supported                |
+| `days_in_month`                | `days_in_month(up)`                                                              | Supported                |
+| `deg`                          | `deg(up)`                                                                        | Supported                |
+| `delta`                        | `delta(http_server_request_duration_count[5m])`                                  | Supported                |
+| `deriv`                        | `deriv(http_server_request_duration_count[5m])`                                  | Supported                |
+| `double_exponential_smoothing` | `double_exponential_smoothing(http_server_request_duration_count[5m], 0.5, 0.5)` | Supported (experimental) |
+| `end`                          | `end()`                                                                          | Supported (experimental) |
+| `exp`                          | `exp(up)`                                                                        | Supported                |
+| `first_over_time`              | `first_over_time(up[5m])`                                                        | Supported (experimental) |
+| `floor`                        | `floor(up)`                                                                      | Supported                |
+| `histogram_avg`                | `histogram_avg(showcase_latency_exp_hist)`                                       | Supported                |
+| `histogram_count`              | `histogram_count(showcase_latency_exp_hist)`                                     | Supported                |
+| `histogram_fraction`           | `histogram_fraction(0, 1, showcase_latency_exp_hist)`                            | Supported                |
+| `histogram_quantile`           | `histogram_quantile(0.9, showcase_latency_exp_hist)`                             | Supported                |
+| `histogram_quantiles`          | `histogram_quantiles(showcase_latency_exp_hist, "q", 0.5, 0.9)`                  | Supported (experimental) |
+| `histogram_stddev`             | `histogram_stddev(showcase_latency_exp_hist)`                                    | Supported                |
+| `histogram_stdvar`             | `histogram_stdvar(showcase_latency_exp_hist)`                                    | Supported                |
+| `histogram_sum`                | `histogram_sum(showcase_latency_exp_hist)`                                       | Supported                |
+| `hour`                         | `hour(up)`                                                                       | Supported                |
+| `idelta`                       | `idelta(http_server_request_duration_count[5m])`                                 | Supported                |
+| `increase`                     | `increase(http_server_request_duration_count[5m])`                               | Supported                |
+| `info`                         | `info(http_server_request_duration_count)`                                       | Supported (experimental) |
+| `irate`                        | `irate(http_server_request_duration_count[5m])`                                  | Supported                |
+| `label_join`                   | `label_join(up, "dst", ",", "job")`                                              | Supported                |
+| `label_replace`                | `label_replace(up, "dst", "$1", "job", "(.*)")`                                  | Supported                |
+| `last_over_time`               | `last_over_time(up[5m])`                                                         | Supported                |
+| `ln`                           | `ln(up)`                                                                         | Supported                |
+| `log10`                        | `log10(up)`                                                                      | Supported                |
+| `log2`                         | `log2(up)`                                                                       | Supported                |
+| `mad_over_time`                | `mad_over_time(up[5m])`                                                          | Supported (experimental) |
+| `max_over_time`                | `max_over_time(up[5m])`                                                          | Supported                |
+| `min_over_time`                | `min_over_time(up[5m])`                                                          | Supported                |
+| `minute`                       | `minute(up)`                                                                     | Supported                |
+| `month`                        | `month(up)`                                                                      | Supported                |
+| `pi`                           | `pi()`                                                                           | Supported                |
+| `predict_linear`               | `predict_linear(http_server_request_duration_count[5m], 0.5)`                    | Supported                |
+| `present_over_time`            | `present_over_time(up[5m])`                                                      | Supported                |
+| `quantile_over_time`           | `quantile_over_time(0.5, up[5m])`                                                | Supported                |
+| `rad`                          | `rad(up)`                                                                        | Supported                |
+| `range`                        | `range()`                                                                        | Supported (experimental) |
+| `rate`                         | `rate(http_server_request_duration_count[5m])`                                   | Supported                |
+| `resets`                       | `resets(http_server_request_duration_count[5m])`                                 | Supported                |
+| `round`                        | `round(up, 0.5)`                                                                 | Supported                |
+| `scalar`                       | `scalar(up)`                                                                     | Supported                |
+| `sgn`                          | `sgn(up)`                                                                        | Supported                |
+| `sin`                          | `sin(up)`                                                                        | Supported                |
+| `sinh`                         | `sinh(up)`                                                                       | Supported                |
+| `sort`                         | `sort(up)`                                                                       | Supported                |
+| `sort_by_label`                | `sort_by_label(up, "s")`                                                         | Supported (experimental) |
+| `sort_by_label_desc`           | `sort_by_label_desc(up, "s")`                                                    | Supported (experimental) |
+| `sort_desc`                    | `sort_desc(up)`                                                                  | Supported                |
+| `sqrt`                         | `sqrt(up)`                                                                       | Supported                |
+| `start`                        | `start()`                                                                        | Supported (experimental) |
+| `stddev_over_time`             | `stddev_over_time(up[5m])`                                                       | Supported                |
+| `stdvar_over_time`             | `stdvar_over_time(up[5m])`                                                       | Supported                |
+| `step`                         | `step()`                                                                         | Supported (experimental) |
+| `sum_over_time`                | `sum_over_time(up[5m])`                                                          | Supported                |
+| `tan`                          | `tan(up)`                                                                        | Supported                |
+| `tanh`                         | `tanh(up)`                                                                       | Supported                |
+| `time`                         | `time()`                                                                         | Supported                |
+| `timestamp`                    | `timestamp(up)`                                                                  | Supported                |
+| `ts_of_first_over_time`        | `ts_of_first_over_time(up[5m])`                                                  | Supported (experimental) |
+| `ts_of_last_over_time`         | `ts_of_last_over_time(up[5m])`                                                   | Supported (experimental) |
+| `ts_of_max_over_time`          | `ts_of_max_over_time(up[5m])`                                                    | Supported (experimental) |
+| `ts_of_min_over_time`          | `ts_of_min_over_time(up[5m])`                                                    | Supported (experimental) |
+| `vector`                       | `vector(0.5)`                                                                    | Supported                |
+| `year`                         | `year(up)`                                                                       | Supported                |
 
 #### Binary operators
 

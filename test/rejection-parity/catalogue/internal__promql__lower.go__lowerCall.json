@@ -5,7 +5,7 @@
       "site": "internal/promql/lower.go:lowerCall#682975f8",
       "message": "promql: function %s is not a recognized lowering target",
       "class": "internal",
-      "rationale": "quantile_over_time is special-cased above; every remaining function name the parser accepts is covered before this point: the arg0 shape check (now peeling ParenExpr/StepInvariantExpr via peelWrappers, #1896) catches every function whose argument position is Matrix-typed -- the rangeVectorFn set plus absent_over_time, whose sole argument the parser always types as Matrix -- and every other function name is covered by isHistogramValueFn (the native-histogram value accessors), the exhaustive switch above, or instantFnCH. The date-function switch retains timestamp through timestampFunctionName, whose value is the same parser function name. The query-context functions range and step are folded to NumberLiterals by preprocessQuery in every lowering entry that evaluates an expression (Lower, LowerAtRangeOpts), so no call to either reaches lowerCall; LowerMetadataRange and lowerMetadataCatalog lower bare selectors only. No parseable function name reaches this fallback. lowerSubqueryOverInstantTransform, which replaced lowerSubqueryOverCall as this direct caller for the sample-preserving-transform arm, hands lowerCall the SAME parsed call isInstantTransformCall already confirmed names a real instantTransformFns member, so it reaches this fallback no more than lower itself does.",
+      "rationale": "quantile_over_time is special-cased above; every remaining function name the parser accepts is covered before this point: the arg0 shape check (now peeling ParenExpr/StepInvariantExpr via peelWrappers, #1896) catches every function whose argument position is Matrix-typed -- the rangeVectorFn set plus absent_over_time, whose sole argument the parser always types as Matrix -- and every other function name is covered by isHistogramValueFn (the native-histogram value accessors), the exhaustive switch above, or instantFnCH. The date-function switch retains timestamp through timestampFunctionName, whose value is the same parser function name. The query-context functions range and step are folded to NumberLiterals by preprocessQuery in every lowering entry that evaluates an expression (Lower, LowerAtRangeOpts), so no call to either reaches lowerCall; start and end are folded the same way wherever a request range exists and otherwise stop at their own case of the switch above; LowerMetadataRange and lowerMetadataCatalog lower bare selectors only. No parseable function name reaches this fallback. lowerSubqueryOverInstantTransform, which replaced lowerSubqueryOverCall as this direct caller for the sample-preserving-transform arm, hands lowerCall the SAME parsed call isInstantTransformCall already confirmed names a real instantTransformFns member, so it reaches this fallback no more than lower itself does.",
       "evidence": {
         "guard": [
           "past returning if c.Func.Name == \"quantile_over_time\"",
@@ -35,10 +35,10 @@
     },
     {
       "head": "promql",
-      "site": "internal/promql/lower.go:lowerCall#87f33f63",
-      "message": "promql: function %s() is only valid inside an @ modifier (e.g. up @ %s()), not as a standalone call",
-      "class": "rejection",
-      "trigger_query": "start()",
+      "site": "internal/promql/lower.go:lowerCall#79baf025",
+      "message": "promql: function %s() requires query range context (use LowerAt)",
+      "class": "internal",
+      "rationale": "Only Lower, the one lowering entry with no request range, leaves a start() or end() call for this arm. LowerAtRangeOpts, which LowerAt and LowerAtRange call and which the PromQL HTTP query endpoints lower through with the request's start and end, runs preprocessQuery first, and it folds every start() and end() call to a NumberLiteral holding the request's bound, so none reaches lowerCall there. Lower has no caller outside tests; LowerMetadataRange and lowerMetadataCatalog lower bare selectors only. lowerSubqueryOverInstantCall and lowerSubqueryOverInstantTransform hand lowerCall calls from the same already-preprocessed tree.",
       "evidence": {
         "guard": [
           "past returning if c.Func.Name == \"quantile_over_time\"",
@@ -49,6 +49,18 @@
           "lower",
           "lowerSubqueryOverInstantCall",
           "lowerSubqueryOverInstantTransform"
+        ],
+        "cited": [
+          "Lower",
+          "LowerAt",
+          "LowerAtRange",
+          "LowerAtRangeOpts",
+          "LowerMetadataRange",
+          "lowerCall",
+          "lowerMetadataCatalog",
+          "lowerSubqueryOverInstantCall",
+          "lowerSubqueryOverInstantTransform",
+          "preprocessQuery"
         ]
       }
     }
