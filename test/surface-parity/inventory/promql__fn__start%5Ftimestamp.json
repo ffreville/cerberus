@@ -1,0 +1,13 @@
+{
+  "entries": [
+    {
+      "head": "promql",
+      "symbol": "fn:start_timestamp",
+      "kind": "function",
+      "probe": "start_timestamp(up)",
+      "cerberus": "accept",
+      "reference": "accept",
+      "class": "parity-accept"
+    }
+  ]
+}

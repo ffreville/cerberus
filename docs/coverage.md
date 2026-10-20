@@ -25,18 +25,15 @@ same query.
 | **Supported (experimental)**         | A symbol the upstream parser gates behind an experimental-functions flag. Cerberus enables that flag in its production parser (PromQL: `--enable-feature=promql-experimental-functions`), so these work out of the box. Treat them as you would on upstream — they are experimental *upstream*, not flaky in cerberus. |
 | **Supported (cerberus extension)**   | Cerberus accepts a query the reference's default configuration rejects, and answers it correctly. Rare; called out explicitly.                                                                                                                                                                                         |
 | **Rejected (parity with reference)** | Cerberus rejects it *and so does the reference* under the same configuration — a deliberate, parity-preserving gate, not a gap.                                                                                                                                                                                        |
-| **Not yet supported**                | Cerberus rejects a symbol the reference accepts — a real coverage gap. No symbol carries this status; specific argument *shapes* of supported symbols do, and are counted separately in [Coverage at a glance](#coverage-at-a-glance).                                                                                 |
+| **Not yet supported**                | Cerberus rejects a symbol the reference accepts — a real coverage gap. Specific argument *shapes* of supported symbols carry it too, and are counted separately in [Coverage at a glance](#coverage-at-a-glance).                                                                                                      |
 
 This is the human-facing translation of cerberus's machine-readable
 conformance **ledger** in [`test/surface-parity/`](../test/surface-parity/)
 ([Layer 6d](test-strategy.md#layer-6d--function-surface-parity-ledger) of the
 test map). The ledger classifies each symbol four ways — `parity-accept`,
 `parity-reject`, `wrong-reject`, `wrong-accept` — which is the right vocabulary
-for the test ratchet but the wrong one for a reader: `start()` / `end()` /
-`range()` / `step()` read as "wrong-accept" in the ledger (see
-[the note on the query-context functions](#a-note-on-the-promql-query-context-functions))
-yet they are genuinely **Supported (experimental)** for a user. The table above
-performs that translation.
+for the test ratchet but the wrong one for a reader. The table above performs
+that translation.
 
 The ledger is **symbol-level**: it records whether cerberus accepts a symbol at
 all, not which argument *shapes* of that symbol it accepts. A function listed
@@ -61,10 +58,10 @@ figure here can only ever be what the ledger tallies.
 
 | Head      | Symbols probed | Supported (incl. experimental) | Intentionally rejected (parity) | Wrong-rejected symbols |
 | --------- | -------------- | ------------------------------ | ------------------------------- | ---------------------- |
-| PromQL    | 121            | 121                            | 0                               | 0                      |
+| PromQL    | 124            | 124                            | 0                               | 0                      |
 | LogQL     | 62             | 62                             | 0                               | 0                      |
 | TraceQL   | 45             | 45                             | 0                               | 0                      |
-| **Total** | **228**        | **228**                        | **0**                           | **0**                  |
+| **Total** | **231**        | **231**                        | **0**                           | **0**                  |
 
 <!-- END AUTOGEN: coverage-glance -->
 
@@ -123,8 +120,8 @@ instants does not.
 `start()`, `end()`, `range()` and `step()` are experimental upstream and
 **Supported** in cerberus. Cerberus folds each to a constant once per query,
 wherever it sits (at the root, as a scalar argument, inside a subquery), exactly
-as `foldQueryContextFunctions` does in the Prometheus engine library its parser
-and test oracle come from:
+as `foldQueryContextFunctions` does in Prometheus v3.15.0, the release its
+parser, its test oracle and the surface-parity reference server all run:
 
 | Function  | Instant query at `t` | Range query over `[start, end]` |
 | --------- | -------------------- | ------------------------------- |
@@ -136,12 +133,12 @@ and test oracle come from:
 Every value is in seconds. `start()` and `end()` are Unix times truncated to
 whole milliseconds.
 
-The surface-parity reference is the released `prom/prometheus:v3.11.3` server,
-whose grammar predates these four functions: it rejects a bare `start()` /
-`end()` as a parse error and parses `range()` / `step()` as duration
-expressions it cannot evaluate at the top level. That is why the raw ledger
-records all four as `wrong-accept`. The `@ start()` / `@ end()` modifiers are a
-separate construct, **Supported** by both, and listed under Modifiers.
+The `@ start()` / `@ end()` modifiers are a separate construct, also
+**Supported**, and listed under Modifiers.
+
+`start_timestamp(v)` is **Supported (experimental)** and answers an empty
+vector, for instant and range queries, as Prometheus does without its
+`use-start-timestamps` feature flag.
 
 ## Per-symbol tables
 
@@ -157,7 +154,7 @@ The `Probe` column is the exact query the ledger evaluates for that symbol.
 
 <!-- BEGIN AUTOGEN: coverage-tables (.github/scripts/gen-coverage.mjs) -->
 
-### PromQL (121 symbols)
+### PromQL (124 symbols)
 
 #### Aggregations
 
@@ -210,7 +207,7 @@ The `Probe` column is the exact query the ledger evaluates for that symbol.
 | `double_exponential_smoothing` | `double_exponential_smoothing(http_server_request_duration_count[5m], 0.5, 0.5)` | Supported (experimental) |
 | `end`                          | `end()`                                                                          | Supported (experimental) |
 | `exp`                          | `exp(up)`                                                                        | Supported                |
-| `first_over_time`              | `first_over_time(up[5m])`                                                        | Supported (experimental) |
+| `first_over_time`              | `first_over_time(up[5m])`                                                        | Supported                |
 | `floor`                        | `floor(up)`                                                                      | Supported                |
 | `histogram_avg`                | `histogram_avg(showcase_latency_exp_hist)`                                       | Supported                |
 | `histogram_count`              | `histogram_count(showcase_latency_exp_hist)`                                     | Supported                |
@@ -232,7 +229,9 @@ The `Probe` column is the exact query the ledger evaluates for that symbol.
 | `log10`                        | `log10(up)`                                                                      | Supported                |
 | `log2`                         | `log2(up)`                                                                       | Supported                |
 | `mad_over_time`                | `mad_over_time(up[5m])`                                                          | Supported (experimental) |
+| `max_of`                       | `max_of(0.5, 0.5)`                                                               | Supported (experimental) |
 | `max_over_time`                | `max_over_time(up[5m])`                                                          | Supported                |
+| `min_of`                       | `min_of(0.5, 0.5)`                                                               | Supported (experimental) |
 | `min_over_time`                | `min_over_time(up[5m])`                                                          | Supported                |
 | `minute`                       | `minute(up)`                                                                     | Supported                |
 | `month`                        | `month(up)`                                                                      | Supported                |
@@ -255,6 +254,7 @@ The `Probe` column is the exact query the ledger evaluates for that symbol.
 | `sort_desc`                    | `sort_desc(up)`                                                                  | Supported                |
 | `sqrt`                         | `sqrt(up)`                                                                       | Supported                |
 | `start`                        | `start()`                                                                        | Supported (experimental) |
+| `start_timestamp`              | `start_timestamp(up)`                                                            | Supported (experimental) |
 | `stddev_over_time`             | `stddev_over_time(up[5m])`                                                       | Supported                |
 | `stdvar_over_time`             | `stdvar_over_time(up[5m])`                                                       | Supported                |
 | `step`                         | `step()`                                                                         | Supported (experimental) |

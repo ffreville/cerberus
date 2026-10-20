@@ -77,7 +77,7 @@ const maxSamples = 1_000_000
 // Cerberus grades PromQL against two independent reference surfaces: this
 // oracle, which builds its own promql.Engine in-process, and the
 // compat lane (compatibility/prometheus/), which runs a real, separately
-// started `prom/prometheus:v3.11.3` server. "Matches the reference" has
+// started `prom/prometheus:v3.15.0` server. "Matches the reference" has
 // exactly one meaning only if both surfaces run the engine the same way.
 //
 // compatibility/prometheus/docker-compose.yml enables only
@@ -97,9 +97,9 @@ const maxSamples = 1_000_000
 // source of truth for all three heads. That default is also not a moving
 // target here: promql-delayed-name-removal has been an opt-in,
 // EXPERIMENTAL feature flag since its introduction (upstream #14477, 3.6.0)
-// straight through the v3.11.3 tag the compat lane pins — including two
+// straight through the v3.15.0 tag the compat lane pins — including two
 // rounds of its OWN bugfixes in that span (upstream #17161, #17678, both
-// already released well before 3.11.3, neither one covering this shape) —
+// already released well before 3.15.0, neither one covering this shape) —
 // with no changelog signal that it is close to becoming Prometheus's
 // default. Aligning this oracle DOWN to the real server's OFF default is
 // therefore aligning to the stable, documented, currently-shipping
@@ -115,6 +115,16 @@ const maxSamples = 1_000_000
 // server's grammar — see Evaluate's own doc for why an accept/reject
 // difference is not the same class of problem as an answer difference.
 const EnableDelayedNameRemoval = false
+
+// UseStartTimestamps is the engine's `use-start-timestamps` option, held to
+// the same rule as [EnableDelayedNameRemoval]: the compat lane's server
+// does not enable that feature, so this oracle does not either. It changes
+// answers — with it on, `start_timestamp(v)` answers each sample's start
+// timestamp, and rate(), irate(), increase() and resets() may read start
+// timestamps — while the server answers `start_timestamp(v)` with an empty
+// vector. test/regression/promql_oracle_engine_parity_test.go pins this
+// constant against the compose file's `--enable-feature=` line.
+const UseStartTimestamps = false
 
 // Series is one input time series: an identifying label set plus its
 // samples, exactly as they were read back out of ClickHouse.
@@ -275,9 +285,9 @@ func Evaluate(tb testing.TB, series []Series, q Query) ([]Result, error) {
 	}
 
 	// Built explicitly, rather than via promqltest.NewTestEngine, so that
-	// EnableDelayedNameRemoval can be set to this package's own constant
-	// instead of that helper's hardcoded true. Every other field mirrors
-	// NewTestEngine's own defaults exactly.
+	// EnableDelayedNameRemoval and UseStartTimestamps can be set to this
+	// package's own constants instead of that helper's hardcoded true.
+	// Every other field mirrors NewTestEngine's own defaults exactly.
 	engine := promqltest.NewTestEngineWithOpts(tb, promql.EngineOpts{
 		MaxSamples: maxSamples,
 		Timeout:    100 * time.Second,
@@ -288,7 +298,7 @@ func Evaluate(tb testing.TB, series []Series, q Query) ([]Result, error) {
 		EnableNegativeOffset:     true,
 		LookbackDelta:            lookbackDelta,
 		EnableDelayedNameRemoval: EnableDelayedNameRemoval,
-		UseStartTimestamps:       true,
+		UseStartTimestamps:       UseStartTimestamps,
 		// This is the one other site test/regression's
 		// TestPromQLParserOptionsHaveASingleSource (#2971) names as exempt
 		// from routing through internal/promql/promparse.New, and for the
