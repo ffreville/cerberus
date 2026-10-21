@@ -417,7 +417,7 @@ func wrapSubqueryIdentity(
 	s schema.Metrics,
 	ctx lowerCtx,
 ) (chplan.Node, error) {
-	rw, err := subqueryIdentityWindow(sub, inner, step, s, ctx)
+	rw, _, err := subqueryIdentityWindow(sub, inner, step, s, ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -425,21 +425,21 @@ func wrapSubqueryIdentity(
 }
 
 // subqueryIdentityWindow is [wrapSubqueryIdentity] for a caller that goes
-// on to adjust the window itself.
+// on to adjust the window itself. It also returns the subquery's anchor.
 func subqueryIdentityWindow(
 	sub *parser.SubqueryExpr,
 	inner chplan.Node,
 	step time.Duration,
 	s schema.Metrics,
 	ctx lowerCtx,
-) (*chplan.RangeWindow, error) {
+) (*chplan.RangeWindow, evalAnchor, error) {
 	anchor, err := subqueryAnchor(sub, ctx)
 	if err != nil {
-		return nil, err
+		return nil, evalAnchor{}, err
 	}
 	inner, err = declareSubqueryTimestampRole(inner, s.TimestampColumn)
 	if err != nil {
-		return nil, err
+		return nil, evalAnchor{}, err
 	}
 	return &chplan.RangeWindow{
 		Input:           inner,
@@ -453,7 +453,7 @@ func subqueryIdentityWindow(
 		TimestampColumn: s.TimestampColumn,
 		ValueColumn:     s.ValueColumn,
 		GroupBy:         []chplan.Expr{&chplan.ColumnRef{Name: s.AttributesColumn}},
-	}, nil
+	}, anchor, nil
 }
 
 // subqueryIdentityValuePreserving reports whether an instantTransformFns
@@ -895,12 +895,12 @@ func lowerSubqueryOverInstantTransform(
 	if err != nil {
 		return nil, err
 	}
-	windowed, err := subqueryIdentityWindow(sub, inner, step, s, ctx)
+	windowed, anchor, err := subqueryIdentityWindow(sub, inner, step, s, ctx)
 	if err != nil {
 		return nil, err
 	}
 	if valuePreserving {
-		boundStaleMarkerLayoutsToIdentity(windowed)
+		boundStaleMarkerLayoutsToIdentity(windowed, anchor)
 	}
 	if valuePreserving || subqueryIdentityEncodesStaleMarker(call.Func.Name) {
 		return dropStaleLatestSamples(windowed, s), nil
@@ -1303,7 +1303,7 @@ func lowerSubqueryOverVectorSelector(
 		ValueColumn:     s.ValueColumn,
 		GroupBy:         []chplan.Expr{&chplan.ColumnRef{Name: s.AttributesColumn}},
 	}
-	boundStaleMarkerLayoutsToIdentity(rw)
+	boundStaleMarkerLayoutsToIdentity(rw, anchor)
 	return dropStaleLatestSamples(rw, s), nil
 }
 
@@ -1425,12 +1425,16 @@ func lowerOuterRangeFnOverSubquery(
 	if err != nil {
 		return nil, err
 	}
-	if rw.Func == fnPredictLinear {
+	rangeMode := ctx.rangeMode()
+	pinned := subqueryPinned(sub)
+	if rw.Func == fnPredictLinear && !pinned {
 		// Prometheus forecasts from the evaluation instant, which the
 		// subquery's offset puts past the right edge of the window the
 		// regression is fitted at (see [instantPredictLinearShift]). A
-		// pinned subquery never reaches here: [lowerCallOverSubquery]
-		// answers it empty, as Prometheus does.
+		// pinned subquery shifts its horizon in the pinned arms below:
+		// Prometheus wraps only the subquery's inner expression in a
+		// StepInvariantExpr, never the subquery itself, so the pinned
+		// window is still fitted and forecast from each evaluation instant.
 		advancePredictLinearHorizon(rw, offsetSecondsExpr(rw.Offset))
 	}
 
@@ -1444,9 +1448,6 @@ func lowerOuterRangeFnOverSubquery(
 	if nameExpr != nil {
 		appendNameGroupKey(rw, s)
 	}
-
-	rangeMode := ctx.rangeMode()
-	pinned := subqueryPinned(sub)
 
 	switch {
 	case rangeMode && pinned:
@@ -1484,6 +1485,12 @@ func lowerOuterRangeFnOverSubquery(
 		broadcastName := nameExpr
 		if broadcastName == nil && rangeFnPreservesName(outer.Func.Name) {
 			broadcastName = &chplan.LitString{V: ""}
+		}
+		if rw.Func == fnPredictLinear {
+			// Fit the pinned window once and broadcast it, then forecast
+			// from each request-grid evaluation instant, as the
+			// pinned-matrix arm of [lowerPredictLinear] does.
+			value = predictLinearBroadcastValue(rw, anchor, s)
 		}
 		return wrapRangeWindowAtBroadcast(rw, ctx, s, broadcastName, value), nil
 	case rangeMode:
@@ -1540,6 +1547,9 @@ func lowerOuterRangeFnOverSubquery(
 		// ts keeps the outer reducer and the widened inner grid on one base.
 		if anchor.anchored() {
 			rw.End = anchor.End()
+			if rw.Func == fnPredictLinear && pinned {
+				advancePredictLinearHorizon(rw, instantPredictLinearShift(anchor, ctx))
+			}
 			// Widen by Offset+Range, matching RangeWindow.InputWindow and the
 			// range-mode branch above (#1464).
 			widenSubquerySpineReadBy(inner, anchor.End(), anchor.End(), rw.Offset, sub.Range)
