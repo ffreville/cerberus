@@ -62,9 +62,27 @@
 //      are identical whether it fired or the mechanism was deleted outright.
 //      This mutation is what proves the sentinel is not a hollow green.
 //
-// The three are ORTHOGONAL memory-bounding mechanisms (a resource-bound
-// throwIf, a disk-spill fallback, a chopt-gated per-query stamp) exercising
-// different sentinels in different corpora — proving one still works says
+//   4. prewhere-split-forced — internal/chsql/emit_node.go's filtered-scan
+//      PREWHERE gate, stripped of its SchemaStrategies.PrewhereByServer
+//      test, so the emitter writes its own PREWHERE split on a server
+//      where move_to_prewhere resolved in (cerberus issue #3955). The
+//      nightly label_values_matcher_stock_key{,_renamed} sentinels read the
+//      matcher's attribute maps for every row of the metric's granules
+//      again and go red on their committed memory ceiling.
+//
+//   5. aggregation-in-order-stamp-lost — internal/engine/
+//      query_settings_rules.go's optimize_aggregation_in_order stamp,
+//      disabled. ClickHouse then hash-aggregates the instant selector the
+//      nightly instant_selector_in_order sentinel issues; peak memory does
+//      not separate the two plans beyond run-to-run noise, so that
+//      sentinel goes red on its pipeline prong, which requires
+//      AggregatingInOrderTransform in EXPLAIN PIPELINE of the dispatched
+//      statement.
+//
+// The five are ORTHOGONAL mechanisms (a resource-bound throwIf, a
+// disk-spill fallback, a chopt-gated per-query stamp, the PREWHERE split, the
+// in-order aggregation stamp) exercising different sentinels in different
+// corpora — proving one still works says
 // nothing about the others. Per #2437's own scope, this is deliberately NOT
 // exhaustive: one representative injected regression per mechanism is the
 // goal, not covering every possible defeat of every sentinel.
@@ -76,7 +94,10 @@
 // this script was written, it fails LOUDLY rather than silently mutating
 // nothing), run the mutation's own `just` recipe, revert the file
 // UNCONDITIONALLY (even on a script crash) via `git checkout --`, and record
-// whether the gate failed as expected. This never commits or pushes
+// whether the gate failed as expected. A mutation counts as caught only when
+// every sentinel it names reports a failed subtest: a recipe that fails for
+// another sentinel — one already near its ceiling, say — proves nothing about
+// the mechanism the mutation broke. This never commits or pushes
 // anything — the mutation lives only in the ephemeral CI checkout for the
 // span of one `just` invocation.
 //
@@ -108,6 +129,7 @@ export const MUTATIONS = [
       '#2429 resource bound request_rate_by_method/error_ratio_by_namespace rely on to be rejected (422).',
     recipe: 'perf-nightly-integration',
     file: 'internal/chsql/rate_window_fanout_bound.go',
+    sentinels: ['request_rate_by_method', 'error_ratio_by_namespace'],
     find: 'maxRateWindowFanoutRows = 2_800_000\n',
     replace: 'maxRateWindowFanoutRows = 2_800_000_000\n',
   },
@@ -118,6 +140,7 @@ export const MUTATIONS = [
       'never engages, letting pod_status_reason_gauge (~77% of the memory cap) OOM for real instead of spilling.',
     recipe: 'perf-nightly-integration',
     file: 'internal/engine/spill.go',
+    sentinels: ['pod_status_reason_gauge'],
     find: 'return maxMemory / spillCapDenominator\n',
     replace: 'return maxMemory * 1000\n',
   },
@@ -129,8 +152,33 @@ export const MUTATIONS = [
       'join_spill_vector_join sentinel reads that setting back out of system.query_log and must go red.',
     recipe: 'perf-smoke-integration',
     file: 'internal/engine/spill.go',
+    sentinels: ['join_spill_vector_join'],
     find: '\treturn chclient.WithQuerySetting(ctx, settingMaxBytesBeforeExternalJoin, spillThreshold(maxMemory))\n',
     replace: '\treturn ctx\n',
+  },
+  {
+    id: 'prewhere-split-forced',
+    description:
+      "Strip internal/chsql/emit_node.go's filtered-scan PREWHERE gate of its PrewhereByServer test, so the " +
+      'emitter writes its own PREWHERE split where move_to_prewhere resolved in (issue #3955). The nightly ' +
+      'label_values_matcher_stock_key{,_renamed} sentinels must go red on their committed memory ceiling.',
+    recipe: 'perf-nightly-integration',
+    file: 'internal/chsql/emit_node.go',
+    sentinels: ['label_values_matcher_stock_key', 'label_values_matcher_stock_key_renamed'],
+    find: 'if !strategies.PrewhereByServer && !scanReadsSubquery(scan) && projectionTouchesWide(scan.Columns, shape) {\n',
+    replace: 'if !scanReadsSubquery(scan) && projectionTouchesWide(scan.Columns, shape) {\n',
+  },
+  {
+    id: 'aggregation-in-order-stamp-lost',
+    description:
+      "Disable internal/engine/query_settings_rules.go's optimize_aggregation_in_order stamp, so ClickHouse " +
+      'hash-aggregates a GROUP BY over a sorting-key prefix. The nightly instant_selector_in_order sentinel ' +
+      'must go red on its pipeline prong (AggregatingInOrderTransform in EXPLAIN PIPELINE).',
+    recipe: 'perf-nightly-integration',
+    file: 'internal/engine/query_settings_rules.go',
+    sentinels: ['instant_selector_in_order'],
+    find: 'if r.OptimizeAggregationInOrder && r.eligibleForAggregationInOrder(f, strategies) {\n',
+    replace: 'if false && r.OptimizeAggregationInOrder && r.eligibleForAggregationInOrder(f, strategies) {\n',
   },
 ];
 
@@ -187,13 +235,45 @@ function runGate(recipe) {
   return { caught: res.status !== 0, output: `${res.stdout}\n${res.stderr}` };
 }
 
+// failedSentinels — the subset of names whose subtest `go test` reported as
+// failed in output (a `--- FAIL: <Test>/.../<name> (` line). A gate recipe
+// that fails for some other sentinel, or for a reason unrelated to the
+// mutation, does not count as catching it: only the sentinels a mutation
+// names prove the mechanism it breaks is guarded.
+export function failedSentinels(output, names) {
+  return names.filter((name) => {
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`--- FAIL: \\S*/${escaped} \\(`).test(output);
+  });
+}
+
+// failureDetail — the output lines that report on any of names, so the log
+// shows what each named sentinel measured when it failed.
+export function failureDetail(output, names) {
+  return output
+    .split('\n')
+    .filter((line) => /_test\.go:\d+:/.test(line) && names.some((name) => line.includes(`${name}:`) || line.includes(`${name} `)))
+    .join('\n');
+}
+
 // runOneMutation — apply, run, revert (always), report. Never leaves the
-// tree mutated even if `just` itself throws an unexpected error.
+// tree mutated even if `just` itself throws an unexpected error. The mutation
+// is caught when the recipe failed AND every sentinel it names failed.
 export function runOneMutation(mutation) {
   applyMutation(mutation);
   try {
-    const { caught, output } = runGate(mutation.recipe);
-    return { id: mutation.id, description: mutation.description, recipe: mutation.recipe, caught, output };
+    const { caught: recipeFailed, output } = runGate(mutation.recipe);
+    const failed = failedSentinels(output, mutation.sentinels);
+    const caught = recipeFailed && failed.length === mutation.sentinels.length;
+    return {
+      id: mutation.id,
+      description: mutation.description,
+      recipe: mutation.recipe,
+      caught,
+      failed,
+      detail: failureDetail(output, mutation.sentinels),
+      output,
+    };
   } finally {
     revertMutation(mutation);
   }
@@ -212,11 +292,15 @@ async function main() {
     assertCleanTree(`after reverting mutation "${mutation.id}"`);
     results.push(result);
     if (result.caught) {
-      log(`perf-nightly-selfcheck: "${mutation.id}" was caught — the gate failed as expected.`);
+      log(
+        `perf-nightly-selfcheck: "${mutation.id}" was caught — ${result.failed.join(', ')} failed as expected:\n` +
+          result.detail,
+      );
     } else {
       error(
-        `perf-nightly-selfcheck: "${mutation.id}" was NOT caught — the nightly gate stayed green despite ` +
-          `this injected regression (gate: just ${mutation.recipe}). ${mutation.description}`,
+        `perf-nightly-selfcheck: "${mutation.id}" was NOT caught — of the sentinels it names ` +
+          `(${mutation.sentinels.join(', ')}), only [${result.failed.join(', ')}] failed under this injected ` +
+          `regression (gate: just ${mutation.recipe}). ${mutation.description}`,
         { title: 'perf-nightly self-check: bit-rot detected' },
       );
       log(`--- last just ${mutation.recipe} output for "${mutation.id}" ---\n${result.output}`);
