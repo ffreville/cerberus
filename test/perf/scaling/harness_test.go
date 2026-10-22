@@ -66,7 +66,6 @@ package scaling
 
 import (
 	"database/sql"
-	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -130,8 +129,10 @@ type Construct struct {
 	// (the recursion-depth case).
 	Seed func() string
 
-	// Reseed rebuilds the row set for one parameter value, run before each
-	// Point. It must hold the scan-row count ~constant across the sweep
+	// Reseed rebuilds the row set for one parameter value, run once per
+	// Point inside that Point's own database (the driver makes it current;
+	// see usePointDatabase), so its statements and the Point's SQL must name
+	// tables unqualified. It must hold the scan-row count ~constant across the sweep
 	// (the driver records each point's scan rows and bounds the
 	// cardinality against the SAME denominator, so a drifting scan count
 	// would make the bound meaningless — assert it stays fixed in the
@@ -163,11 +164,6 @@ type Construct struct {
 	// shapes whose floor is dominated by fixed per-query overhead. Default
 	// (0) is treated as 0.75 — comfortably sub-linear while portable.
 	SubLinearSlack float64
-
-	// Iters is the timed-sample count for each Point's wall measurement;
-	// the driver takes the MEDIAN of these samples (after a warm-up pass)
-	// so a single fast/slow run can't skew the ratio. Default (0) -> 5.
-	Iters int
 
 	// KnownSuperlinear quarantines the wall-time invariant (a) as a
 	// DOCUMENTED OPEN FINDING rather than a hard failure: the driver still
@@ -233,51 +229,51 @@ func openChDB(t *testing.T) *sql.DB {
 	return db
 }
 
-// warmupRuns is the count of untimed priming executions done before any
-// timed sample. The first execution of a query under chDB pays one-off
-// costs that are NOT part of the compute being measured — lazy engine
-// init, plan/parse caching, cold OS page cache for the just-seeded table.
-// Discarding them keeps a single cold run from distorting a point's wall
-// (which, on a sub-20ms floor, swings the K=2/K=8 ratio the gate reads).
-const warmupRuns = 1
-
-// medianWall runs the timed query `iters` times (after warmupRuns priming
-// passes) and returns the MEDIAN wall, not the min.
+// wallRounds is the number of interleaved sampling rounds behind every
+// point's wall, and the wall is the MINIMUM over those rounds. One round
+// times each point of the sweep once, in sweep order, so every point is
+// sampled across the same stretch of wall-clock time.
 //
-// Why median, not min: the gate compares a RATIO of two point timings
-// (last/first), and the K=2 floor is dominated by fixed per-query
-// overhead (~15ms), so the ratio is hypersensitive to its denominator. A
-// min estimator is a single-sample extreme: one unusually fast K=2 pass
-// (or one slow K=8 pass) on a shared CI runner skews the ratio by a third
-// or more — exactly the run-to-run jitter that tripped this gate by 1.6%
-// at the 3.6x line while the deterministic cardinality axis stayed flat.
-// The median is the central order statistic: insensitive to a single fast
-// OR slow outlier at either endpoint, so the ratio reflects the SUSTAINED
-// compute cost (a real super-linear regression moves every sample, so the
-// median moves with it and the gate still bites).
-func medianWall(t *testing.T, db *sql.DB, q string, args []any, iters int) time.Duration {
+// Interference on a shared runner only ever ADDS time to a run: a
+// scheduler stall, CFS throttling or a noisy neighbour delays the query
+// and nothing makes it finish faster than its own compute. So the minimum
+// over repeats converges on the query's uncontended cost, where a median of
+// back-to-back samples does not: a contention burst that outlasts half of a
+// point's consecutive samples moves the median of that point alone, and the
+// endpoint ratio with it. Interleaving keeps a burst from landing on one
+// point exclusively, and the minimum needs only ONE clean round per point.
+// The first round's cold-start costs (lazy engine init, the first parse of a
+// query shape) are discarded the same way, so no untimed warm-up pass is
+// needed.
+//
+// 9 is measured, not chosen. Under synthetic contention (the harness in a
+// 300% CPUQuota cgroup, whose CFS throttling stalls a multithreaded query
+// mid-run, beside stress-ng bursts on a 200% quota, on a 6-core host already
+// at load 6-15) 30 trials of every wall-gated construct recorded 15
+// interleaved rounds each. Taking the minimum over every 9-of-15 subset of a
+// trial's rounds (900,900 resampled sweeps across the six gated constructs)
+// tripped no gate; the worst endpoint ratio reached 0.88 of its gate
+// (setop_chain), and the six constructs' worst cases were 0.15-0.88. At 7
+// rounds one resampled sweep in 1.16M crossed a gate (setop_chain, 1.02);
+// at 5, 38 in 540,540 did, and a single round failed up to 2 of a
+// construct's 30 trials.
+// The former estimator (a warm-up pass, then the median of 5 back-to-back
+// samples per point) failed 3 of the same 180 trials outright: setop_chain
+// twice (5.62x against 5.45x) and structural_recursive once (16.37x against
+// 15.25x). A real super-linear regression slows every round, so the minimum
+// still carries it (see TestScalingWallGate_CatchesSuperlinear).
+const wallRounds = 9
+
+// timeWall runs `SELECT count() FROM (<q>)` once and returns its wall time.
+func timeWall(t *testing.T, db *sql.DB, q string, args []any) time.Duration {
 	t.Helper()
-	if iters <= 0 {
-		iters = 5
-	}
 	wrapped := "SELECT count() FROM (" + q + ")"
-	run := func() time.Duration {
-		s := time.Now()
-		var c int64
-		if err := db.QueryRow(wrapped, args...).Scan(&c); err != nil {
-			t.Fatalf("wall query: %v\nSQL: %s", err, q)
-		}
-		return time.Since(s)
+	s := time.Now()
+	var c int64
+	if err := db.QueryRow(wrapped, args...).Scan(&c); err != nil {
+		t.Fatalf("wall query: %v\nSQL: %s", err, q)
 	}
-	for range warmupRuns {
-		run()
-	}
-	samples := make([]time.Duration, iters)
-	for i := range samples {
-		samples[i] = run()
-	}
-	slices.Sort(samples)
-	return samples[len(samples)/2]
+	return time.Since(s)
 }
 
 // cardinalityOf returns `count() FROM (<level>)` — the row count one
