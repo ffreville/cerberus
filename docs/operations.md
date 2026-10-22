@@ -2733,7 +2733,10 @@ against a morning — every post-cutover write would read as a mismatch, and
 on a deployment still taking DELTA traffic a clean PASS would be
 unreachable no matter how complete the backfill was. Both reads are
 therefore bounded strictly below the start of the cutover day, and the day
-is named in its own `NOTE` rather than silently dropped. It needs no sum
+is named in its own `NOTE` rather than silently dropped. The cutover day is
+`--before`'s calendar day in the timezone the sum table's timestamp column
+type names, or the server's when it names none — the day the MV's
+`toStartOfDay(TimeUnix)` buckets split at. It needs no sum
 check: the backfill covers everything strictly older than the instant and
 the MV covers everything from the instant onward, so the two windows meet
 exactly — the property the exact-instant `--before` bound exists to
@@ -3298,6 +3301,19 @@ gets the setting for no `GROUP BY`, and startup logs a warning naming it. A
 `Distributed` table, which carries no key of its own, and every table when
 the check does not run (`CERBERUS_REQUIREMENTS_CHECK=false`, `cerberus
 migrate`'s preview) use the key cerberus provisions.
+
+`PREWHERE` promotion follows the same deployed key. A filter over a table
+whose wide columns the statement reads is split into `PREWHERE` and `WHERE`,
+and its conjuncts are ordered by the position their column takes in the
+table's sort key — each key element counted as the column it reads, so
+`toUnixTimestamp64Nano(TimeUnix)` ranks `TimeUnix`. Over a stock
+ServiceName-first table a `ServiceName` conjunct therefore comes before a
+`MetricName` one. A table renamed through `CERBERUS_SCHEMA_*` is ranked by
+its own deployed key. A table whose key cannot be read, a `Distributed`
+table, and a table the check did not reach rank by the key cerberus
+provisions; with the check off, only the default-named tables get a
+`PREWHERE` split, ranked by the provisioned key. The ranking never changes
+a result, only which columns ClickHouse reads first.
 
 The timestamp type is **not** correctness-neutral. `seconds` is **lossy**:
 ClickHouse truncates every sample, start and exemplar timestamp to its
