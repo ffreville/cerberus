@@ -106,8 +106,12 @@ type Config struct {
 // auto-picker decided to enable against the probed server version. It is the
 // single source of truth every consumer reads; nothing downstream re-reads the
 // raw env.
+//
+// Beside the feature ids it carries one build fact no selection decides:
+// whether a query may still disable the analyzer (LegacyAnalyzer).
 type EnabledSet struct {
-	ids map[string]struct{}
+	ids            map[string]struct{}
+	legacyAnalyzer bool
 }
 
 // Has reports whether feature id is in the resolved set.
@@ -116,12 +120,31 @@ func (s EnabledSet) Has(id string) bool {
 	return ok
 }
 
-// Equal reports whether s and other enable exactly the same feature ids. A
-// periodic re-resolution compares its result against the set already in force
-// and swaps (and logs) only on a genuine transition, so a server whose
-// capabilities have not moved produces no churn and no log noise.
+// LegacyAnalyzer reports whether a query may run with the analyzer disabled
+// (enable_analyzer=0): true when the set was resolved against a build on which
+// AnalyzerMandatory does not hold. Every selection, "off" included, resolves
+// it the same way, because it is not a feature the operator turns on — it
+// records what the server still permits. It is not among IDs.
+func (s EnabledSet) LegacyAnalyzer() bool {
+	return s.legacyAnalyzer
+}
+
+// WithLegacyAnalyzer returns s with LegacyAnalyzer replaced by allowed, for a
+// caller that knows more builds than the one s was resolved against: one
+// reachable build on which the analyzer is mandatory is enough to withhold
+// it, while the ids are resolved against the oldest.
+func (s EnabledSet) WithLegacyAnalyzer(allowed bool) EnabledSet {
+	s.legacyAnalyzer = allowed
+	return s
+}
+
+// Equal reports whether s and other enable exactly the same feature ids and
+// agree on LegacyAnalyzer. A periodic re-resolution compares its result
+// against the set already in force and swaps (and logs) only on a genuine
+// transition, so a server whose capabilities have not moved produces no churn
+// and no log noise.
 func (s EnabledSet) Equal(other EnabledSet) bool {
-	return sameIDs(s.ids, other.ids)
+	return s.legacyAnalyzer == other.legacyAnalyzer && sameIDs(s.ids, other.ids)
 }
 
 // sameIDs reports whether a and b hold exactly the same keys.
@@ -246,7 +269,7 @@ func Resolve(cfg Config, server Version) (EnabledSet, []string, error) {
 	}
 	warnings = append(warnings, legacyWarns...)
 
-	return EnabledSet{ids: enabled}, warnings, nil
+	return EnabledSet{ids: enabled, legacyAnalyzer: !AnalyzerMandatory(server)}, warnings, nil
 }
 
 // resolveTokens walks the parsed selection tokens. An "auto" token unions in

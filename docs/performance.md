@@ -531,8 +531,11 @@ the physical memory cap. Query duration is recorded but is not a latency gate.
 
 ## Query nesting depth
 
-Native-histogram plans run under ClickHouse's older query analyzer
-(`enable_analyzer=0`, stamped by the engine's native-histogram analyzer rule).
+Below ClickHouse 26.9, native-histogram plans run under ClickHouse's older
+query analyzer (`enable_analyzer=0`, stamped by the engine's native-histogram
+analyzer rule, whatever `chOptimizations` selects). From 26.9 the analyzer is
+mandatory and these plans run under it like every other plan, as soon as any
+reachable node runs such a build.
 That analyzer re-walks a derived query's whole subtree for every derived-query
 level above it, so a request's planning time grows with its nesting depth times
 the size of the expressions beneath each level. Emitters keep nesting shallow:

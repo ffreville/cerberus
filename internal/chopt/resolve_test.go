@@ -1577,3 +1577,80 @@ func TestConditionCacheUnsafeBuilds_ExplicitRequest(t *testing.T) {
 		t.Errorf("permissive warnings = %v; want one naming ClickHouse#107145", warns)
 	}
 }
+
+// TestAnalyzerMandatory pins the builds on which a query may no longer ask for
+// enable_analyzer=0: every 26.9 build and every later line, and nothing older.
+func TestAnalyzerMandatory(t *testing.T) {
+	for _, tc := range []struct {
+		server Version
+		want   bool
+	}{
+		{Version{Major: 24, Minor: 8}, false},
+		{Version{Major: 26, Minor: 8, Patch: 10, Build: 6}, false},
+		{Version{Major: 26, Minor: 9}, true},
+		{Version{Major: 26, Minor: 9, Patch: 25, Build: 15}, true},
+		{Version{Major: 26, Minor: 10}, true},
+		{Version{Major: 27, Minor: 1}, true},
+	} {
+		if got := AnalyzerMandatory(tc.server); got != tc.want {
+			t.Errorf("AnalyzerMandatory(%s) = %v; want %v", tc.server, got, tc.want)
+		}
+	}
+}
+
+// TestResolve_LegacyAnalyzerIgnoresSelection pins that whether a query may
+// disable the analyzer is read off the build alone: auto, off, an explicit
+// list without auto, and a permissive list all resolve it the same way, and it
+// never appears among the ids.
+func TestResolve_LegacyAnalyzerIgnoresSelection(t *testing.T) {
+	for _, server := range []struct {
+		version Version
+		want    bool
+	}{
+		{Version{Major: 24, Minor: 8}, true},
+		{Version{Major: 26, Minor: 8, Patch: 10, Build: 6}, true},
+		{Version{Major: 26, Minor: 9, Patch: 25, Build: 15}, false},
+		{Version{Major: 26, Minor: 10}, false},
+	} {
+		for _, cfg := range []Config{
+			{Optimizations: SelectionAuto},
+			{Optimizations: "off"},
+			{Optimizations: FeatureAggregationInOrder, Mode: Enforcing},
+			{Optimizations: FeatureAggregationInOrder, Mode: Permissive},
+		} {
+			set, _, err := Resolve(cfg, server.version)
+			if err != nil {
+				t.Fatalf("Resolve(%q) on %s: %v", cfg.Optimizations, server.version, err)
+			}
+			if got := set.LegacyAnalyzer(); got != server.want {
+				t.Errorf("Resolve(%q) on %s: LegacyAnalyzer() = %v; want %v", cfg.Optimizations, server.version, got, server.want)
+			}
+			if slices.Contains(set.IDs(), "native_histogram_legacy_analyzer") {
+				t.Errorf("Resolve(%q) on %s: IDs() = %v; the analyzer fact is not a feature id", cfg.Optimizations, server.version, set.IDs())
+			}
+		}
+	}
+}
+
+// TestEnabledSet_WithLegacyAnalyzer pins that the override replaces only the
+// analyzer fact and that Equal sees it, so a re-probe that learns a node now
+// runs a mandatory-analyzer build swaps the rules even though no id moved.
+func TestEnabledSet_WithLegacyAnalyzer(t *testing.T) {
+	set, _, err := Resolve(Config{Optimizations: SelectionAuto}, Version{Major: 26, Minor: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	withheld := set.WithLegacyAnalyzer(false)
+	if withheld.LegacyAnalyzer() || !set.LegacyAnalyzer() {
+		t.Fatalf("WithLegacyAnalyzer(false): got %v, original %v; want false, true", withheld.LegacyAnalyzer(), set.LegacyAnalyzer())
+	}
+	if !slices.Equal(withheld.IDs(), set.IDs()) {
+		t.Errorf("WithLegacyAnalyzer changed the ids: %v -> %v", set.IDs(), withheld.IDs())
+	}
+	if set.Equal(withheld) {
+		t.Error("Equal reports sets that disagree on LegacyAnalyzer as equal")
+	}
+	if !set.Equal(withheld.WithLegacyAnalyzer(true)) {
+		t.Error("Equal reports sets with the same ids and analyzer fact as different")
+	}
+}

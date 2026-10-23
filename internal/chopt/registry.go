@@ -2438,6 +2438,19 @@ func KnownUnsafe(id string, server Version) bool {
 	return ok && len(f.unsafeRanges(server)) > 0
 }
 
+// AnalyzerMandatorySince is the first ClickHouse release line whose query
+// analyzer a query cannot disable: 26.9 refuses enable_analyzer=0 with
+// SETTING_CONSTRAINT_VIOLATION (code 452), and later lines accept the setting
+// but ignore it.
+var AnalyzerMandatorySince = Version{Major: 26, Minor: 9}
+
+// AnalyzerMandatory reports whether server runs every query under the query
+// analyzer, so a query must not ask for enable_analyzer=0. Like KnownUnsafe it
+// is independent of any selection: it is a property of the build.
+func AnalyzerMandatory(server Version) bool {
+	return server.AtLeast(AnalyzerMandatorySince)
+}
+
 // conditionCacheUnsafeBuilds are the ClickHouse builds on which the query
 // condition cache silently drops rows from a later read. Both defects write a
 // "no granule matches" verdict under a predicate's cache key when something
