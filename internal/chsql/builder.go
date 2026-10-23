@@ -1168,6 +1168,9 @@ func (b *Builder) exprFunc(f *chplan.FuncCall) error {
 	if f.Fn == chplan.FnMapContainsKey {
 		return b.exprMapContainsKey(f.Args)
 	}
+	if f.Fn == chplan.FnMapSort {
+		return b.exprCanonicalMap(f.Args)
+	}
 	if jsonFullMapFns[f.Fn] {
 		f = b.substituteJSONFullMapArgs(f)
 	}
@@ -2577,6 +2580,44 @@ func Cast(f Frag, typ string) Frag {
 		b.sb.WriteString(" AS ")
 		b.sb.WriteString(typ)
 		b.sb.WriteByte(')')
+	}
+}
+
+// CanonicalMap renders the canonical, key-ordered form of a label Map —
+// the series-identity key every GROUP BY, ORDER BY, PARTITION BY and match
+// key over a whole label set binds to — as [chplan.CanonicalMapFunc] over
+// m. Under SchemaStrategies.CanonicalMapTypeCast the call is cast back to
+// the type ClickHouse parses from m's type name:
+//
+//	CAST(mapSort(<m>), toTypeName(<m>))
+//
+// m is rendered once; its text and bound arguments are replayed into
+// toTypeName rather than rendered a second time, and toTypeName is folded
+// to a constant during analysis, so the replayed copy is never evaluated.
+// mapSort keeps its argument's key and value types, so m's type name is
+// the name of the sorted Map's own type and the cast converts no value.
+// canonical_map.go records why the cast exists and why it reads m's type
+// rather than naming the sorted Map with an inline alias.
+func CanonicalMap(m Frag) Frag {
+	return func(b *Builder) {
+		typeCast := b.strategies.CanonicalMapTypeCast
+		if typeCast {
+			b.sb.WriteString("CAST(")
+		}
+		b.sb.WriteString(chplan.CanonicalMapFunc)
+		b.sb.WriteByte('(')
+		start, argStart, scanStart := b.sb.Len(), len(b.args), b.physicalScans
+		m(b)
+		b.sb.WriteByte(')')
+		if !typeCast {
+			return
+		}
+		text, argEnd := b.sb.String()[start:b.sb.Len()-1], len(b.args)
+		b.sb.WriteString(", toTypeName(")
+		b.sb.WriteString(text)
+		b.args = append(b.args, b.args[argStart:argEnd]...)
+		b.physicalScans += b.physicalScans - scanStart
+		b.sb.WriteString("))")
 	}
 }
 
