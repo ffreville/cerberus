@@ -190,12 +190,7 @@ func spanLinksJSON(links []spanLink) []SpanLinkEntry {
 	}
 	out := make([]SpanLinkEntry, 0, len(links))
 	for _, l := range links {
-		out = append(out, SpanLinkEntry{
-			TraceID:    l.TraceID,
-			SpanID:     l.SpanID,
-			TraceState: l.TraceState,
-			Attributes: l.Attributes,
-		})
+		out = append(out, SpanLinkEntry(l))
 	}
 	return out
 }
